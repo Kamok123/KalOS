@@ -10,3 +10,4 @@
 void vmm_init();
 void vmm_map_page(uint64_t virt, uint64_t phys, uint64_t flags);
 uint64_t vmm_virt_to_phys(uint64_t virt);
+uint64_t vmm_phys_to_virt(uint64_t phys);

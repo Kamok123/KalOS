@@ -51,6 +51,10 @@ void vmm_init() {
     pml4 = (uint64_t*)(cr3 + hhdm_offset);
 }
 
+uint64_t vmm_phys_to_virt(uint64_t phys) {
+    return phys + hhdm_offset;
+}
+
 void vmm_map_page(uint64_t virt, uint64_t phys, uint64_t flags) {
     uint64_t pml4_index = (virt >> 39) & 0x1FF;
     uint64_t pdpt_index = (virt >> 30) & 0x1FF;

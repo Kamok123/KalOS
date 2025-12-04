@@ -102,7 +102,7 @@ static uint64_t cursor_y = 210;
 extern "C" void exception_handler(void* stack_frame) {
     (void)stack_frame;
     if (g_framebuffer) {
-        draw_string(g_framebuffer, 50, 110, "EXCEPTION CAUGHT!", 0xFF0000);
+        draw_string(g_framebuffer, 50, 400, "EXCEPTION CAUGHT!", 0xFF0000);
     }
     hcf();
 }
@@ -186,9 +186,10 @@ extern "C" void _start(void) {
     // In a real OS, we'd map pages. Here we just grab 1MB contiguous if possible
     // or just use a single page for demo.
     // Let's alloc 1 page (4KB) for the heap for now to be safe with PMM
-    void* heap_page = pmm_alloc_frame();
-    if (heap_page) {
-        heap_init(heap_page, 4096);
+    void* heap_phys = pmm_alloc_frame();
+    if (heap_phys) {
+        void* heap_virt = (void*)vmm_phys_to_virt((uint64_t)heap_phys);
+        heap_init(heap_virt, 4096);
         draw_string(framebuffer, 50, 290, "Heap Initialized.  ", 0x00FF00);
         
         // Test allocation

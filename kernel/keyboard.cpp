@@ -16,6 +16,7 @@ static volatile uint8_t kb_buffer_end = 0;
 
 // Shift state
 static uint8_t shift_held = 0;
+static uint8_t caps_lock = 0;
 
 // US keyboard layout (lowercase)
 static const char scancode_to_ascii[128] = {
@@ -43,12 +44,9 @@ static const char scancode_to_ascii_shift[128] = {
 
 void keyboard_init() {
     // Flush any pending data in the keyboard buffer
-    // This prevents race conditions from leftover boot data
     while (inb(KEYBOARD_STATUS_PORT) & 0x01) {
         inb(KEYBOARD_DATA_PORT);
     }
-    
-    // Now enable keyboard IRQ
     pic_clear_mask(1);
 }
 
@@ -70,11 +68,25 @@ void keyboard_handler() {
         return;
     }
     
+    if (scancode == 0x3A) { // Caps Lock
+        caps_lock = !caps_lock;
+        return;
+    }
+    
     char c;
     if (shift_held) {
         c = scancode_to_ascii_shift[scancode];
     } else {
         c = scancode_to_ascii[scancode];
+    }
+    
+    // Handle Caps Lock for letters
+    if (caps_lock) {
+        if (c >= 'a' && c <= 'z') {
+            c = c - 'a' + 'A';
+        } else if (c >= 'A' && c <= 'Z') {
+            c = c - 'A' + 'a';
+        }
     }
     
     if (c != 0) {
