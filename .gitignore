@@ -1,0 +1,19 @@
+# Build artifacts
+*.o
+*.elf
+*.iso
+iso_root/
+build/
+
+# Limine bootloader (downloaded)
+limine/
+
+# Editor/IDE
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS specific
+.DS_Store
+Thumbs.db
