@@ -91,6 +91,7 @@ static void draw_string(struct limine_framebuffer *fb, uint64_t x, uint64_t y, c
 #include "timer.h"
 #include "pmm.h"
 #include "vmm.h"
+#include "heap.h"
 
 // Global framebuffer pointer for use in handlers
 static struct limine_framebuffer* g_framebuffer = nullptr;
@@ -172,12 +173,32 @@ extern "C" void _start(void) {
     
     draw_string(framebuffer, 50, 190, "Hardware Ready.", 0x00FF00);
     
-    draw_string(framebuffer, 50, 220, "Initializing PMM...", 0xFFFF00);
+    draw_string(framebuffer, 50, 210, "Initializing PMM...", 0xFFFF00);
     pmm_init();
+    draw_string(framebuffer, 50, 230, "PMM Initialized.   ", 0x00FF00);
     
     draw_string(framebuffer, 50, 250, "Initializing VMM...", 0xFFFF00);
     vmm_init();
-    draw_string(framebuffer, 50, 250, "VMM Initialized.   ", 0x00FF00);
+    draw_string(framebuffer, 50, 270, "VMM Initialized.   ", 0x00FF00);
+    
+    // Initialize Heap (1MB)
+    // We need a free memory region. For now, let's grab a frame from PMM
+    // In a real OS, we'd map pages. Here we just grab 1MB contiguous if possible
+    // or just use a single page for demo.
+    // Let's alloc 1 page (4KB) for the heap for now to be safe with PMM
+    void* heap_page = pmm_alloc_frame();
+    if (heap_page) {
+        heap_init(heap_page, 4096);
+        draw_string(framebuffer, 50, 290, "Heap Initialized.  ", 0x00FF00);
+        
+        // Test allocation
+        char* test_str = (char*)malloc(16);
+        if (test_str) {
+            test_str[0] = 'H'; test_str[1] = 'e'; test_str[2] = 'a'; test_str[3] = 'p'; test_str[4] = 0;
+            draw_string(framebuffer, 250, 290, test_str, 0x00FFFF);
+            free(test_str);
+        }
+    }
     
     // Display memory stats
     uint64_t free_mem = pmm_get_free_memory() / 1024 / 1024;
@@ -207,11 +228,11 @@ extern "C" void _start(void) {
     }
     mem_str[i++] = 'M'; mem_str[i++] = 'B'; mem_str[i] = 0;
     
-    draw_string(framebuffer, 50, 280, mem_str, 0x00FF00);
+    draw_string(framebuffer, 50, 310, mem_str, 0x00FF00);
 
-    draw_string(framebuffer, 50, 310, "> ", 0x00FFFF);
+    draw_string(framebuffer, 50, 330, "> ", 0x00FFFF);
     cursor_x = 68;
-    cursor_y = 310;
+    cursor_y = 330;
 
     // Enable interrupts
     asm("sti");
