@@ -68,6 +68,7 @@ static void cmd_help() {
     print("  cat   - Read file (cat <file>)\n");
     print("  mem   - Show memory stats\n");
     print("  clear - Clear screen\n");
+    print("  user  - Run user mode test\n");
 }
 
 static void cmd_ls() {
@@ -149,6 +150,12 @@ static void execute_command() {
         clear_screen();
         cmd_len = 0;
         return;
+    } else if (strcmp(cmd_buffer, "user") == 0) {
+        print("Launching user mode test...\n");
+        // We'll call a function from kernel that jumps to user mode
+        extern void run_user_test();
+        run_user_test();
+        print("Returned from user mode.\n");
     } else {
         print("Unknown command. Type 'help'.\n");
     }

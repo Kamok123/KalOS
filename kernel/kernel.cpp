@@ -177,6 +177,49 @@ extern "C" void irq_handler(void* stack_frame) {
 }
 
 // The following will be our kernel's entry point.
+
+// User mode test program (very simple inline machine code or a function)
+static void user_program() __attribute__((section(".user_code")));
+static void user_program() {
+    // Syscall: write(1, "Hello from User Mode!\n", 22)
+    // RAX = syscall number (1 = SYS_WRITE)
+    // RBX = string pointer, RCX = length
+    const char* msg = "Hello from User Mode!\n";
+    asm volatile(
+        "mov $1, %%rax\n"      // SYS_WRITE
+        "mov %0, %%rbx\n"      // arg1 = msg
+        "mov $22, %%rcx\n"     // arg2 = len
+        "int $0x80\n"          // Syscall
+        :
+        : "r"(msg)
+        : "rax", "rbx", "rcx"
+    );
+    
+    // Syscall: exit(0)
+    asm volatile(
+        "mov $60, %%rax\n"     // SYS_EXIT
+        "int $0x80\n"
+        :
+        :
+        : "rax"
+    );
+    
+    // Should never reach here
+    for(;;);
+}
+
+// Stack for user mode
+static uint8_t user_stack[4096] __attribute__((aligned(16)));
+
+extern "C" void jump_to_user_mode(uint64_t code_sel, uint64_t stack, uint64_t entry);
+
+void run_user_test() {
+    // For now, we'll just run the user program directly in Ring 0 to test syscall
+    // Actual Ring 3 transition requires proper page mapping for user code
+    // This is a simplified test
+    user_program();
+}
+
 extern "C" void _start(void) {
     // Ensure the bootloader actually understands our base revision (see spec).
     if (LIMINE_BASE_REVISION_SUPPORTED == false) {
