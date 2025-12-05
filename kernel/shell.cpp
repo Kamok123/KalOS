@@ -13,6 +13,7 @@ static uint64_t cursor_y = 370;
 extern void draw_char(struct limine_framebuffer *fb, uint64_t x, uint64_t y, char c, uint32_t color);
 extern void draw_string(struct limine_framebuffer *fb, uint64_t x, uint64_t y, const char *str, uint32_t color);
 extern void clear_char(struct limine_framebuffer *fb, uint64_t x, uint64_t y, uint32_t bg_color);
+extern "C" void jump_to_user_mode(uint64_t code_sel, uint64_t stack, uint64_t entry);
 
 // String helpers
 static int strcmp(const char* s1, const char* s2) {
@@ -69,7 +70,8 @@ static void cmd_help() {
     print("  mem   - Show memory stats\n");
     print("  clear - Clear screen\n");
     print("  user  - Run user mode test\n");
-    print("  exec  - Run ELF (exec <file>)\n");
+    print("  exec  - Run ELF (Ring 0)\n");
+    print("  run3  - Run ELF (Ring 3)\n");
 }
 
 static void cmd_ls() {
@@ -180,6 +182,30 @@ static void execute_command() {
                     void (*entry_fn)() = (void(*)())entry;
                     entry_fn();
                     print("Program exited.\n");
+                } else {
+                    print("Failed to load ELF.\n");
+                }
+            } else {
+                print("Not a valid ELF file.\n");
+            }
+        } else {
+            print("File not found.\n");
+        }
+    } else if (strncmp(cmd_buffer, "run3 ", 5) == 0) {
+        const char* filename = cmd_buffer + 5;
+        const UniFSFile* file = unifs_open(filename);
+        if (file) {
+            extern bool elf_validate(const uint8_t* data, uint64_t size);
+            extern uint64_t elf_load_user(const uint8_t* data, uint64_t size);
+            
+            if (elf_validate(file->data, file->size)) {
+                print("Loading ELF for Ring 3...\n");
+                uint64_t entry = elf_load_user(file->data, file->size);
+                if (entry) {
+                    print("Jumping to Ring 3...\n");
+                    // Use the mapped user stack at 0x7FFF1000
+                    jump_to_user_mode(0x1B, 0x7FFF1000, entry);
+                    print("Returned from Ring 3.\n");
                 } else {
                     print("Failed to load ELF.\n");
                 }

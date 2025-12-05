@@ -9,5 +9,9 @@
 
 void vmm_init();
 void vmm_map_page(uint64_t virt, uint64_t phys, uint64_t flags);
+void vmm_map_page_in(uint64_t* pml4, uint64_t virt, uint64_t phys, uint64_t flags);
 uint64_t vmm_virt_to_phys(uint64_t virt);
 uint64_t vmm_phys_to_virt(uint64_t phys);
+uint64_t* vmm_create_address_space();
+void vmm_switch_address_space(uint64_t* pml4_phys);
+uint64_t* vmm_get_kernel_pml4();

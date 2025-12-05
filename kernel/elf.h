@@ -61,3 +61,4 @@ struct Elf64_Phdr {
 // ELF Loader functions
 bool elf_validate(const uint8_t* data, uint64_t size);
 uint64_t elf_load(const uint8_t* data, uint64_t size);
+uint64_t elf_load_user(const uint8_t* data, uint64_t size);

@@ -80,3 +80,68 @@ uint64_t vmm_virt_to_phys(uint64_t virt) {
     // TODO: Walk page tables to find physical address
     return 0; 
 }
+
+uint64_t* vmm_get_kernel_pml4() {
+    return pml4;
+}
+
+// Get the next page table level (with custom pml4)
+static uint64_t* get_next_level_in(uint64_t* current_level, uint64_t index, bool alloc) {
+    if (current_level[index] & PTE_PRESENT) {
+        uint64_t phys = current_level[index] & 0x000FFFFFFFFFF000;
+        return (uint64_t*)(phys + hhdm_offset);
+    }
+
+    if (!alloc) return nullptr;
+
+    void* frame = pmm_alloc_frame();
+    if (!frame) return nullptr;
+
+    uint64_t phys = (uint64_t)frame;
+    current_level[index] = phys | PTE_PRESENT | PTE_WRITABLE | PTE_USER;
+    
+    uint64_t* next_level = (uint64_t*)(phys + hhdm_offset);
+    for (int i = 0; i < 512; i++) next_level[i] = 0;
+    
+    return next_level;
+}
+
+void vmm_map_page_in(uint64_t* target_pml4, uint64_t virt, uint64_t phys, uint64_t flags) {
+    uint64_t pml4_index = (virt >> 39) & 0x1FF;
+    uint64_t pdpt_index = (virt >> 30) & 0x1FF;
+    uint64_t pd_index   = (virt >> 21) & 0x1FF;
+    uint64_t pt_index   = (virt >> 12) & 0x1FF;
+
+    uint64_t* pdpt = get_next_level_in(target_pml4, pml4_index, true);
+    if (!pdpt) return;
+
+    uint64_t* pd = get_next_level_in(pdpt, pdpt_index, true);
+    if (!pd) return;
+
+    uint64_t* pt = get_next_level_in(pd, pd_index, true);
+    if (!pt) return;
+
+    pt[pt_index] = phys | flags;
+}
+
+uint64_t* vmm_create_address_space() {
+    // Allocate a new PML4
+    void* frame = pmm_alloc_frame();
+    if (!frame) return nullptr;
+    
+    uint64_t* new_pml4 = (uint64_t*)((uint64_t)frame + hhdm_offset);
+    
+    // Clear the new PML4
+    for (int i = 0; i < 512; i++) new_pml4[i] = 0;
+    
+    // Copy kernel mappings (upper half - indices 256-511)
+    for (int i = 256; i < 512; i++) {
+        new_pml4[i] = pml4[i];
+    }
+    
+    return new_pml4;
+}
+
+void vmm_switch_address_space(uint64_t* new_pml4_phys) {
+    asm volatile("mov %0, %%cr3" :: "r"(new_pml4_phys) : "memory");
+}
