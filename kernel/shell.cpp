@@ -25,13 +25,36 @@ static int strncmp(const char* s1, const char* s2, size_t n) {
     return *(const unsigned char*)s1 - *(const unsigned char*)s2;
 }
 
+static void scroll_screen() {
+    uint32_t* fb = (uint32_t*)framebuffer->address;
+    uint64_t pitch = framebuffer->pitch / 4;
+    uint64_t width = framebuffer->width;
+    uint64_t height = framebuffer->height;
+    
+    // Move everything up by 10 pixels
+    for (uint64_t y = 10; y < height; y++) {
+        for (uint64_t x = 0; x < width; x++) {
+            fb[(y - 10) * pitch + x] = fb[y * pitch + x];
+        }
+    }
+    
+    // Clear last 10 lines
+    for (uint64_t y = height - 10; y < height; y++) {
+        for (uint64_t x = 0; x < width; x++) {
+            fb[y * pitch + x] = 0x000022; // Background color
+        }
+    }
+}
+
 static void new_line() {
     cursor_x = 50;
     cursor_y += 10;
-    // Check screen bounds
+    
     if (cursor_y >= framebuffer->height - 20) {
-        cursor_y = 90;  // Reset to top
+        scroll_screen();
+        cursor_y -= 10;
     }
+    
     draw_string(framebuffer, cursor_x, cursor_y, "> ", 0x00FFFF);
     cursor_x = 68;
 }
@@ -55,9 +78,21 @@ static void print(const char* str) {
         if (*str == '\n') {
             cursor_x = 50;
             cursor_y += 10;
+            if (cursor_y >= framebuffer->height - 20) {
+                scroll_screen();
+                cursor_y -= 10;
+            }
         } else {
             draw_char(framebuffer, cursor_x, cursor_y, *str, 0xFFFFFF);
             cursor_x += 9;
+            if (cursor_x >= framebuffer->width - 50) {
+                cursor_x = 50;
+                cursor_y += 10;
+                if (cursor_y >= framebuffer->height - 20) {
+                    scroll_screen();
+                    cursor_y -= 10;
+                }
+            }
         }
         str++;
     }
@@ -90,9 +125,21 @@ static void cmd_cat(const char* filename) {
             if (c == '\n' || c == '\r') {
                 cursor_x = 50;
                 cursor_y += 10;
+                if (cursor_y >= framebuffer->height - 20) {
+                    scroll_screen();
+                    cursor_y -= 10;
+                }
             } else {
                 draw_char(framebuffer, cursor_x, cursor_y, c, 0xFFFFFF);
                 cursor_x += 9;
+                if (cursor_x >= framebuffer->width - 50) {
+                    cursor_x = 50;
+                    cursor_y += 10;
+                    if (cursor_y >= framebuffer->height - 20) {
+                        scroll_screen();
+                        cursor_y -= 10;
+                    }
+                }
             }
         }
         print("\n");
@@ -138,6 +185,12 @@ static void execute_command() {
     
     cursor_y += 10;
     cursor_x = 50;
+    
+    // Check if command execution pushes us off screen
+    if (cursor_y >= framebuffer->height - 20) {
+        scroll_screen();
+        cursor_y -= 10;
+    }
     
     if (strcmp(cmd_buffer, "help") == 0) {
         cmd_help();
@@ -214,5 +267,15 @@ void shell_process_char(char c) {
         cmd_buffer[cmd_len++] = c;
         draw_char(framebuffer, cursor_x, cursor_y, c, 0xFFFFFF);
         cursor_x += 9;
+        
+        // Wrap text while typing
+        if (cursor_x >= framebuffer->width - 50) {
+             cursor_x = 50;
+             cursor_y += 10;
+             if (cursor_y >= framebuffer->height - 20) {
+                 scroll_screen();
+                 cursor_y -= 10;
+             }
+        }
     }
 }
