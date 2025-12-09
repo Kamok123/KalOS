@@ -145,3 +145,31 @@ uint64_t* vmm_create_address_space() {
 void vmm_switch_address_space(uint64_t* new_pml4_phys) {
     asm volatile("mov %0, %%cr3" :: "r"(new_pml4_phys) : "memory");
 }
+
+// MMIO virtual address allocator
+// Start at a high kernel address that won't conflict with other mappings
+static uint64_t mmio_next_virt = 0xFFFFFFFF90000000ULL;
+
+uint64_t vmm_map_mmio(uint64_t phys_addr, uint64_t size) {
+    if (size == 0) return 0;
+    
+    // Align to page boundary
+    uint64_t phys_page = phys_addr & ~0xFFFULL;
+    uint64_t offset = phys_addr & 0xFFF;
+    uint64_t pages = (size + offset + 0xFFF) / 0x1000;
+    
+    // Get virtual address for this mapping
+    uint64_t virt_base = mmio_next_virt;
+    mmio_next_virt += pages * 0x1000;
+    
+    // Map each page with MMIO flags (uncacheable)
+    for (uint64_t i = 0; i < pages; i++) {
+        uint64_t virt = virt_base + i * 0x1000;
+        uint64_t phys = phys_page + i * 0x1000;
+        vmm_map_page(virt, phys, PTE_MMIO);
+    }
+    
+    // Return virtual address with original offset
+    return virt_base + offset;
+}
+

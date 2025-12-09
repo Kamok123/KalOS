@@ -4,10 +4,8 @@
 #include "pipe.h"
 #include "process.h"
 #include "debug.h"
+#include "graphics.h"
 #include <stddef.h>
-
-extern struct limine_framebuffer* g_framebuffer;
-extern void draw_char(struct limine_framebuffer *fb, uint64_t x, uint64_t y, char c, uint32_t color);
 
 static uint64_t sys_cursor_x = 50;
 static uint64_t sys_cursor_y = 480;
@@ -87,7 +85,7 @@ static uint64_t sys_write(int fd, const char* buf, uint64_t count) {
                 sys_cursor_x = 50;
                 sys_cursor_y += 10;
             } else {
-                draw_char(g_framebuffer, sys_cursor_x, sys_cursor_y, buf[i], 0x00FF00);
+                gfx_draw_char(sys_cursor_x, sys_cursor_y, buf[i], COLOR_GREEN);
                 sys_cursor_x += 9;
             }
         }

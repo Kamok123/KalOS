@@ -1,17 +1,14 @@
 #include "shell.h"
 #include "unifs.h"
 #include "pmm.h"
+#include "graphics.h"
 #include <stddef.h>
 
-static struct limine_framebuffer* framebuffer = nullptr;
 static char cmd_buffer[256];
 static int cmd_len = 0;
 static uint64_t cursor_x = 68;
 static uint64_t cursor_y = 90;  // Match kernel's initial prompt position
 
-extern void draw_char(struct limine_framebuffer *fb, uint64_t x, uint64_t y, char c, uint32_t color);
-extern void draw_string(struct limine_framebuffer *fb, uint64_t x, uint64_t y, const char *str, uint32_t color);
-extern void clear_char(struct limine_framebuffer *fb, uint64_t x, uint64_t y, uint32_t bg_color);
 extern "C" void jump_to_user_mode(uint64_t code_sel, uint64_t stack, uint64_t entry);
 
 static int strcmp(const char* s1, const char* s2) {
@@ -25,50 +22,24 @@ static int strncmp(const char* s1, const char* s2, size_t n) {
     return *(const unsigned char*)s1 - *(const unsigned char*)s2;
 }
 
-static void scroll_screen() {
-    uint32_t* fb = (uint32_t*)framebuffer->address;
-    uint64_t pitch = framebuffer->pitch / 4;
-    uint64_t width = framebuffer->width;
-    uint64_t height = framebuffer->height;
-    
-    // Move everything up by 10 pixels
-    for (uint64_t y = 10; y < height; y++) {
-        for (uint64_t x = 0; x < width; x++) {
-            fb[(y - 10) * pitch + x] = fb[y * pitch + x];
-        }
-    }
-    
-    // Clear last 10 lines
-    for (uint64_t y = height - 10; y < height; y++) {
-        for (uint64_t x = 0; x < width; x++) {
-            fb[y * pitch + x] = 0x000022; // Background color
-        }
-    }
-}
-
 static void new_line() {
     cursor_x = 50;
     cursor_y += 10;
     
-    if (cursor_y >= framebuffer->height - 20) {
-        scroll_screen();
+    if (cursor_y >= gfx_get_height() - 20) {
+        gfx_scroll_up(10, COLOR_BLACK);
         cursor_y -= 10;
     }
     
-    draw_string(framebuffer, cursor_x, cursor_y, "> ", 0x00FFFF);
+    gfx_draw_string(cursor_x, cursor_y, "> ", COLOR_CYAN);
     cursor_x = 68;
 }
 
 static void clear_screen() {
-    uint32_t* fb = (uint32_t*)framebuffer->address;
-    for (uint64_t y = 0; y < framebuffer->height; y++) {
-        for (uint64_t x = 0; x < framebuffer->width; x++) {
-            fb[y * (framebuffer->pitch / 4) + x] = 0x000022;
-        }
-    }
+    gfx_clear(COLOR_BLACK);
     cursor_x = 50;
     cursor_y = 50;
-    draw_string(framebuffer, cursor_x, cursor_y, "uniOS Shell (uniSH)", 0xFFFFFF);
+    gfx_draw_string(cursor_x, cursor_y, "uniOS Shell (uniSH)", COLOR_WHITE);
     cursor_y = 70;
     new_line();
 }
@@ -78,18 +49,18 @@ static void print(const char* str) {
         if (*str == '\n') {
             cursor_x = 50;
             cursor_y += 10;
-            if (cursor_y >= framebuffer->height - 20) {
-                scroll_screen();
+            if (cursor_y >= gfx_get_height() - 20) {
+                gfx_scroll_up(10, COLOR_BLACK);
                 cursor_y -= 10;
             }
         } else {
-            draw_char(framebuffer, cursor_x, cursor_y, *str, 0xFFFFFF);
+            gfx_draw_char(cursor_x, cursor_y, *str, COLOR_WHITE);
             cursor_x += 9;
-            if (cursor_x >= framebuffer->width - 50) {
+            if (cursor_x >= gfx_get_width() - 50) {
                 cursor_x = 50;
                 cursor_y += 10;
-                if (cursor_y >= framebuffer->height - 20) {
-                    scroll_screen();
+                if (cursor_y >= gfx_get_height() - 20) {
+                    gfx_scroll_up(10, COLOR_BLACK);
                     cursor_y -= 10;
                 }
             }
@@ -125,18 +96,18 @@ static void cmd_cat(const char* filename) {
             if (c == '\n' || c == '\r') {
                 cursor_x = 50;
                 cursor_y += 10;
-                if (cursor_y >= framebuffer->height - 20) {
-                    scroll_screen();
+                if (cursor_y >= gfx_get_height() - 20) {
+                    gfx_scroll_up(10, COLOR_BLACK);
                     cursor_y -= 10;
                 }
             } else {
-                draw_char(framebuffer, cursor_x, cursor_y, c, 0xFFFFFF);
+                gfx_draw_char(cursor_x, cursor_y, c, COLOR_WHITE);
                 cursor_x += 9;
-                if (cursor_x >= framebuffer->width - 50) {
+                if (cursor_x >= gfx_get_width() - 50) {
                     cursor_x = 50;
                     cursor_y += 10;
-                    if (cursor_y >= framebuffer->height - 20) {
-                        scroll_screen();
+                    if (cursor_y >= gfx_get_height() - 20) {
+                        gfx_scroll_up(10, COLOR_BLACK);
                         cursor_y -= 10;
                     }
                 }
@@ -187,8 +158,8 @@ static void execute_command() {
     cursor_x = 50;
     
     // Check if command execution pushes us off screen
-    if (cursor_y >= framebuffer->height - 20) {
-        scroll_screen();
+    if (cursor_y >= gfx_get_height() - 20) {
+        gfx_scroll_up(10, COLOR_BLACK);
         cursor_y -= 10;
     }
     
@@ -248,7 +219,7 @@ static void execute_command() {
 }
 
 void shell_init(struct limine_framebuffer* fb) {
-    framebuffer = fb;
+    // framebuffer = fb; // No longer needed, using gfx module
     cmd_len = 0;
     cursor_x = 68;
     cursor_y = 90;  // Set initial position
@@ -261,19 +232,19 @@ void shell_process_char(char c) {
         if (cmd_len > 0) {
             cmd_len--;
             cursor_x -= 9;
-            clear_char(framebuffer, cursor_x, cursor_y, 0x000022);
+            gfx_clear_char(cursor_x, cursor_y, COLOR_BLACK);
         }
     } else if (cmd_len < 255) {
         cmd_buffer[cmd_len++] = c;
-        draw_char(framebuffer, cursor_x, cursor_y, c, 0xFFFFFF);
+        gfx_draw_char(cursor_x, cursor_y, c, COLOR_WHITE);
         cursor_x += 9;
         
         // Wrap text while typing
-        if (cursor_x >= framebuffer->width - 50) {
+        if (cursor_x >= gfx_get_width() - 50) {
              cursor_x = 50;
              cursor_y += 10;
-             if (cursor_y >= framebuffer->height - 20) {
-                 scroll_screen();
+             if (cursor_y >= gfx_get_height() - 20) {
+                 gfx_scroll_up(10, COLOR_BLACK);
                  cursor_y -= 10;
              }
         }

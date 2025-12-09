@@ -24,54 +24,6 @@ static volatile LIMINE_REQUESTS_START_MARKER;
 __attribute__((used, section(".requests_end")))
 static volatile LIMINE_REQUESTS_END_MARKER;
 
-#include "font.h"
-
-static void hcf(void) {
-    asm("cli");
-    for (;;) asm("hlt");
-}
-
-static void put_pixel(struct limine_framebuffer *fb, uint64_t x, uint64_t y, uint32_t color) {
-    if (x >= fb->width || y >= fb->height) return;
-    uint32_t *fb_ptr = (uint32_t*)fb->address;
-    fb_ptr[y * (fb->pitch / 4) + x] = color;
-}
-
-void draw_char(struct limine_framebuffer *fb, uint64_t x, uint64_t y, char c, uint32_t color) {
-    if (c < 0 || c > 127) return;
-    const uint8_t *glyph = font8x8[(int)c];
-    for (int row = 0; row < 8; row++) {
-        for (int col = 0; col < 8; col++) {
-            if ((glyph[row] >> (7 - col)) & 1) {
-                put_pixel(fb, x + col, y + row, color);
-            }
-        }
-    }
-}
-
-void clear_char(struct limine_framebuffer *fb, uint64_t x, uint64_t y, uint32_t bg_color) {
-    for (int row = 0; row < 8; row++) {
-        for (int col = 0; col < 9; col++) {
-            put_pixel(fb, x + col, y + row, bg_color);
-        }
-    }
-}
-
-void draw_string(struct limine_framebuffer *fb, uint64_t x, uint64_t y, const char *str, uint32_t color) {
-    uint64_t cursor_x = x;
-    uint64_t cursor_y = y;
-    while (*str) {
-        if (*str == '\n') {
-            cursor_x = x;
-            cursor_y += 10;
-        } else {
-            draw_char(fb, cursor_x, cursor_y, *str, color);
-            cursor_x += 9;
-        }
-        str++;
-    }
-}
-
 #include "gdt.h"
 #include "idt.h"
 #include "pic.h"
@@ -85,9 +37,19 @@ void draw_string(struct limine_framebuffer *fb, uint64_t x, uint64_t y, const ch
 #include "shell.h"
 #include "mouse.h"
 #include "debug.h"
+#include "pci.h"
+#include "usb.h"
+#include "usb_hid.h"
+#include "xhci.h"
+#include "graphics.h"
 
 // Global framebuffer pointer
 struct limine_framebuffer* g_framebuffer = nullptr;
+
+static void hcf(void) {
+    asm("cli");
+    for (;;) asm("hlt");
+}
 
 // Exception handler
 extern "C" void exception_handler(void* stack_frame) {
@@ -97,7 +59,7 @@ extern "C" void exception_handler(void* stack_frame) {
     uint64_t rip = regs[17];
 
     if (g_framebuffer) {
-        draw_string(g_framebuffer, 50, 400, "EXCEPTION!", 0xFF0000);
+        gfx_draw_string(50, 400, "EXCEPTION!", COLOR_RED);
         char buf[32];
         
         buf[0] = 'I'; buf[1] = 'N'; buf[2] = 'T'; buf[3] = ':'; buf[4] = ' ';
@@ -106,7 +68,7 @@ extern "C" void exception_handler(void* stack_frame) {
             buf[5+i] = nibble < 10 ? '0' + nibble : 'A' + nibble - 10;
         }
         buf[21] = 0;
-        draw_string(g_framebuffer, 50, 420, buf, 0xFFFFFF);
+        gfx_draw_string(50, 420, buf, COLOR_WHITE);
         
         buf[0] = 'E'; buf[1] = 'R'; buf[2] = 'R'; buf[3] = ':'; buf[4] = ' ';
         for (int i = 0; i < 16; i++) {
@@ -114,7 +76,7 @@ extern "C" void exception_handler(void* stack_frame) {
             buf[5+i] = nibble < 10 ? '0' + nibble : 'A' + nibble - 10;
         }
         buf[21] = 0;
-        draw_string(g_framebuffer, 50, 440, buf, 0xFFFFFF);
+        gfx_draw_string(50, 440, buf, COLOR_WHITE);
         
         buf[0] = 'R'; buf[1] = 'I'; buf[2] = 'P'; buf[3] = ':'; buf[4] = ' ';
         for (int i = 0; i < 16; i++) {
@@ -122,7 +84,7 @@ extern "C" void exception_handler(void* stack_frame) {
             buf[5+i] = nibble < 10 ? '0' + nibble : 'A' + nibble - 10;
         }
         buf[21] = 0;
-        draw_string(g_framebuffer, 50, 460, buf, 0xFFFFFF);
+        gfx_draw_string(50, 460, buf, COLOR_WHITE);
     }
     hcf();
 }
@@ -210,33 +172,43 @@ void gui_start() {
     gfx_init(g_framebuffer);
     gfx_clear(COLOR_DESKTOP);
     gfx_fill_rect(0, g_framebuffer->height - 30, g_framebuffer->width, 30, COLOR_DARK_GRAY);
-    draw_string(g_framebuffer, 10, g_framebuffer->height - 22, "uniOS Desktop - Press Q to exit", 0xFFFFFF);
+    gfx_draw_string(10, g_framebuffer->height - 22, "uniOS Desktop - Press Q to exit", COLOR_WHITE);
     
     bool running = true;
     backup_x = -1;
     
     while (running) {
-        const MouseState* mouse = mouse_get_state();
-        if (mouse->x != backup_x || mouse->y != backup_y) {
+        usb_hid_poll();
+        
+        // Get mouse state - prefer USB mouse, fallback to PS/2
+        int32_t mx, my;
+        bool left_btn, right_btn, mid_btn;
+        if (usb_hid_mouse_available()) {
+            usb_hid_mouse_get_state(&mx, &my, &left_btn, &right_btn, &mid_btn);
+        } else {
+            const MouseState* mouse = mouse_get_state();
+            mx = mouse->x;
+            my = mouse->y;
+        }
+        
+        if (mx != backup_x || my != backup_y) {
             restore_cursor_area();
-            save_cursor_area(mouse->x, mouse->y);
-            gfx_draw_cursor(mouse->x, mouse->y);
+            save_cursor_area(mx, my);
+            gfx_draw_cursor(mx, my);
         }
-        if (keyboard_has_char()) {
-            char c = keyboard_get_char();
-            if (c == 'q' || c == 'Q' || c == 27) running = false;
+        char c = 0;
+        if (usb_hid_keyboard_has_char()) {
+            c = usb_hid_keyboard_get_char();
+        } else if (keyboard_has_char()) {
+            c = keyboard_get_char();
         }
-        for (volatile int i = 0; i < 50000; i++);
+        if (c == 'q' || c == 'Q' || c == 27) running = false;
+        for (volatile int i = 0; i < 1000; i++);  // Reduced delay for USB
     }
     
-    // Restore shell screen
-    uint32_t* fb = (uint32_t*)g_framebuffer->address;
-    for (uint64_t y = 0; y < g_framebuffer->height; y++) {
-        for (uint64_t x = 0; x < g_framebuffer->width; x++) {
-            fb[y * (g_framebuffer->pitch / 4) + x] = 0x000022;
-        }
-    }
-    draw_string(g_framebuffer, 50, 50, "uniOS Shell (uniSH)", 0xFFFFFF);
+    // Restore shell screen - use black background
+    gfx_clear(COLOR_BLACK);
+    gfx_draw_string(50, 50, "uniOS Shell (uniSH)", COLOR_WHITE);
 }
 
 // Kernel entry point
@@ -246,16 +218,12 @@ extern "C" void _start(void) {
 
     struct limine_framebuffer *fb = framebuffer_request.response->framebuffers[0];
     g_framebuffer = fb;
+    
+    // Initialize graphics subsystem
+    gfx_init(fb);
 
     // Clear screen
-    for (uint64_t y = 0; y < fb->height; y++) {
-        for (uint64_t x = 0; x < fb->width; x++) {
-            put_pixel(fb, x, y, 0x000022);
-        }
-    }
-
-    // Welcome message
-    draw_string(fb, 50, 50, "uniOS v0.1", 0xFFFFFF);
+    gfx_clear(COLOR_BLACK);
 
     // Initialize core systems
     gdt_init();
@@ -284,24 +252,50 @@ extern "C" void _start(void) {
     
     scheduler_init();
     
+    // Initialize USB subsystem
+    pci_init();
+    usb_init();
+    usb_hid_init();
+    
     // Initialize filesystem
     if (module_request.response && module_request.response->module_count > 0) {
         unifs_init(module_request.response->modules[0]->address);
     }
     
+    // Splash screen
+    // Clear screen to black
+    gfx_clear(COLOR_BLACK);
+    
+    // Draw centered "uniOS"
+    gfx_draw_centered_text("uniOS", COLOR_WHITE);
+    
+    // Wait for ~3 seconds
+    // 1000 iterations was ~1ms in previous tests (very rough estimate)
+    // So 3000ms * 1000 = 3,000,000 iterations
+    // But the loop is tight, so let's use a larger number to be safe/visible
+    for (volatile int i = 0; i < 300000000; i++) { }
+    
+    // Clear screen again
+    gfx_clear(COLOR_BLACK);
+    
     // Initialize shell
     shell_init(fb);
-    draw_string(fb, 50, 70, "Type 'help' for commands.", 0x888888);
-    draw_string(fb, 50, 90, "> ", 0x00FFFF);
+    gfx_draw_string(50, 70, "Type 'help' for commands.", COLOR_GRAY);
+    gfx_draw_string(50, 90, "> ", COLOR_CYAN);
 
     asm("sti");
 
     // Main loop
     while (true) {
-        if (keyboard_has_char()) {
+        // Poll USB devices
+        usb_hid_poll();
+        
+        // Check USB keyboard first, then PS/2 fallback
+        if (usb_hid_keyboard_has_char()) {
+            shell_process_char(usb_hid_keyboard_get_char());
+        } else if (keyboard_has_char()) {
             shell_process_char(keyboard_get_char());
         }
         scheduler_yield();
-        asm("hlt");
     }
 }

@@ -1,0 +1,887 @@
+#include "xhci.h"
+#include "pci.h"
+#include "io.h"
+#include "vmm.h"
+#include "pmm.h"
+#include "heap.h"
+#include <stddef.h>
+
+// Global xHCI controller instance
+static XhciController xhci;
+static bool xhci_initialized = false;
+
+// Forward declarations
+static void xhci_ring_doorbell(uint8_t slot_id, uint8_t target);
+static bool xhci_send_command(Trb* trb, Trb* result);
+static bool xhci_wait_command_completion(Trb* result, uint32_t timeout_ms);
+
+// Check if xHCI is initialized
+bool xhci_is_initialized() {
+    return xhci_initialized;
+}
+
+// Get max ports
+uint8_t xhci_get_max_ports() {
+    return xhci_initialized ? xhci.max_ports : 0;
+}
+
+
+// Memory allocation helpers - returns physical address
+static uint64_t alloc_page_aligned(uint64_t size) {
+    uint64_t pages = (size + 0xFFF) / 0x1000;
+    void* first_page = pmm_alloc_frame();
+    if (!first_page) return 0;
+    
+    // Allocate contiguous pages
+    for (uint64_t i = 1; i < pages; i++) {
+        void* page = pmm_alloc_frame();
+        if (!page) return 0;
+        // Note: PMM returns physical addresses, assuming contiguous allocation
+    }
+    
+    return (uint64_t)first_page;
+}
+
+// Zero memory at virtual address
+static void zero_memory(void* virt, uint64_t size) {
+    uint8_t* p = (uint8_t*)virt;
+    for (uint64_t i = 0; i < size; i++) {
+        p[i] = 0;
+    }
+}
+
+// Initialize xHCI controller
+bool xhci_init() {
+    if (xhci_initialized) return true;
+    
+    // Find xHCI controller via PCI
+    PciDevice pci_dev;
+    if (!pci_find_xhci(&pci_dev)) {
+        return false;
+    }
+    
+    // Enable PCI features
+    pci_enable_memory_space(&pci_dev);
+    pci_enable_bus_mastering(&pci_dev);
+    
+    // Get BAR0 (MMIO base)
+    uint64_t bar_size;
+    uint64_t bar_phys = pci_get_bar(&pci_dev, 0, &bar_size);
+    if (bar_phys == 0 || bar_size == 0) {
+        return false;
+    }
+    
+    // Map MMIO region properly (not via HHDM - MMIO is device memory, not RAM)
+    uint64_t bar_virt = vmm_map_mmio(bar_phys, bar_size);
+    if (bar_virt == 0) {
+        return false;
+    }
+    
+    // Setup capability registers pointer
+    xhci.cap = (volatile XhciCapRegs*)bar_virt;
+    
+    // Read capability length and setup other register pointers
+    uint8_t cap_length = xhci.cap->caplength;
+    xhci.op = (volatile XhciOpRegs*)(bar_virt + cap_length);
+    xhci.runtime = (volatile XhciRuntimeRegs*)(bar_virt + xhci.cap->rtsoff);
+    xhci.doorbell = (volatile uint32_t*)(bar_virt + xhci.cap->dboff);
+    xhci.ports = (volatile XhciPortRegs*)(bar_virt + cap_length + 0x400);
+    
+    // Parse capability parameters
+    uint32_t hcsparams1 = xhci.cap->hcsparams1;
+    uint32_t hcsparams2 = xhci.cap->hcsparams2;
+    uint32_t hccparams1 = xhci.cap->hccparams1;
+    
+    xhci.max_slots = HCSPARAMS1_MAX_SLOTS(hcsparams1);
+    xhci.max_ports = HCSPARAMS1_MAX_PORTS(hcsparams1);
+    xhci.max_intrs = HCSPARAMS1_MAX_INTRS(hcsparams1);
+    xhci.context_size_64 = HCCPARAMS1_CSZ(hccparams1);
+    
+    // Reset controller
+    if (!xhci_reset()) {
+        return false;
+    }
+    
+    // Wait for controller ready
+    uint32_t timeout = 100000;
+    while ((mmio_read32((void*)&xhci.op->usbsts) & USBSTS_CNR) && timeout--) {
+        io_wait();
+    }
+    if (timeout == 0) {
+        return false;
+    }
+    
+    // Configure max slots
+    mmio_write32((void*)&xhci.op->config, xhci.max_slots);
+    
+    // Allocate and setup DCBAA (Device Context Base Address Array)
+    uint64_t dcbaa_size = (xhci.max_slots + 1) * sizeof(uint64_t);
+    xhci.dcbaa_phys = alloc_page_aligned(dcbaa_size);
+    if (!xhci.dcbaa_phys) {
+        return false;
+    }
+    xhci.dcbaa = (uint64_t*)vmm_phys_to_virt(xhci.dcbaa_phys);
+    zero_memory(xhci.dcbaa, dcbaa_size);
+    
+    // Setup scratchpad buffers if required
+    uint32_t scratchpad_hi = HCSPARAMS2_MAX_SCRATCHPAD_HI(hcsparams2);
+    uint32_t scratchpad_lo = HCSPARAMS2_MAX_SCRATCHPAD_LO(hcsparams2);
+    uint32_t num_scratchpad = (scratchpad_hi << 5) | scratchpad_lo;
+    
+    if (num_scratchpad > 0) {
+        // Allocate scratchpad buffer array
+        uint64_t array_size = num_scratchpad * sizeof(uint64_t);
+        xhci.scratchpad_array_phys = alloc_page_aligned(array_size);
+        if (!xhci.scratchpad_array_phys) {
+            return false;
+        }
+        xhci.scratchpad_array = (uint64_t*)vmm_phys_to_virt(xhci.scratchpad_array_phys);
+        
+        // Allocate individual scratchpad pages
+        for (uint32_t i = 0; i < num_scratchpad; i++) {
+            uint64_t page_phys = alloc_page_aligned(0x1000);
+            if (!page_phys) {
+                return false;
+            }
+            xhci.scratchpad_array[i] = page_phys;
+        }
+        
+        // Point DCBAA[0] to scratchpad array
+        xhci.dcbaa[0] = xhci.scratchpad_array_phys;
+    }
+    
+    // Write DCBAAP
+    mmio_write64((void*)&xhci.op->dcbaap, xhci.dcbaa_phys);
+    
+    // Allocate and setup Command Ring
+    uint64_t cmd_ring_size = XHCI_RING_SIZE * sizeof(Trb);
+    xhci.cmd_ring_phys = alloc_page_aligned(cmd_ring_size);
+    if (!xhci.cmd_ring_phys) {
+        return false;
+    }
+    xhci.cmd_ring = (Trb*)vmm_phys_to_virt(xhci.cmd_ring_phys);
+    zero_memory(xhci.cmd_ring, cmd_ring_size);
+    xhci.cmd_enqueue = 0;
+    xhci.cmd_cycle = 1;
+    
+    // Setup Link TRB at end of command ring
+    Trb* link_trb = &xhci.cmd_ring[XHCI_RING_SIZE - 1];
+    link_trb->parameter = xhci.cmd_ring_phys;
+    link_trb->status = 0;
+    // Link TRB needs cycle bit set to match producer cycle, plus Toggle Cycle
+    link_trb->control = TRB_TYPE(TRB_TYPE_LINK) | TRB_TC | xhci.cmd_cycle;
+    
+    // Write CRCR (Command Ring Control Register) - just the physical address, cycle bit is in bit 0
+    uint64_t crcr = xhci.cmd_ring_phys | xhci.cmd_cycle;
+    mmio_write64((void*)&xhci.op->crcr, crcr);
+    
+    // Allocate and setup Event Ring
+    uint64_t event_ring_size = XHCI_EVENT_RING_SIZE * sizeof(Trb);
+    xhci.event_ring_phys = alloc_page_aligned(event_ring_size);
+    if (!xhci.event_ring_phys) {
+        return false;
+    }
+    xhci.event_ring = (Trb*)vmm_phys_to_virt(xhci.event_ring_phys);
+    zero_memory(xhci.event_ring, event_ring_size);
+    xhci.event_dequeue = 0;
+    xhci.event_cycle = 1;
+    
+    // Allocate Event Ring Segment Table
+    xhci.erst_phys = alloc_page_aligned(sizeof(ErstEntry));
+    if (!xhci.erst_phys) {
+        return false;
+    }
+    xhci.erst = (ErstEntry*)vmm_phys_to_virt(xhci.erst_phys);
+    xhci.erst[0].ring_segment_base = xhci.event_ring_phys;
+    xhci.erst[0].ring_segment_size = XHCI_EVENT_RING_SIZE;
+    xhci.erst[0].reserved = 0;
+    
+    // Setup primary interrupter (interrupter 0)
+    volatile XhciInterrupterRegs* ir = (volatile XhciInterrupterRegs*)
+        ((uint64_t)xhci.runtime + 0x20);  // Offset 0x20 for interrupter 0
+    
+    // Disable interrupter while setting up
+    mmio_write32((void*)&ir->iman, 0);
+    
+    // Set Event Ring Segment Table Size (must be done before ERSTBA)
+    mmio_write32((void*)&ir->erstsz, 1);
+    
+    // Set Event Ring Dequeue Pointer (must be done before ERSTBA, no EHB yet)
+    mmio_write64((void*)&ir->erdp, xhci.event_ring_phys);
+    
+    // Set Event Ring Segment Table Base Address (writing this enables the ring)
+    mmio_write64((void*)&ir->erstba, xhci.erst_phys);
+    
+    // Set interrupt moderation (4000 = 1ms)
+    mmio_write32((void*)&ir->imod, 4000);
+    
+    // Enable interrupter
+    mmio_write32((void*)&ir->iman, IMAN_IE);
+    
+    // Initialize device context arrays
+    for (int i = 0; i < 256; i++) {
+        xhci.device_contexts[i] = nullptr;
+        xhci.input_contexts[i] = nullptr;
+        for (int j = 0; j < 32; j++) {
+            xhci.transfer_rings[i][j] = nullptr;
+        }
+    }
+    
+    // Start controller
+    if (!xhci_start()) {
+        return false;
+    }
+    
+    xhci_initialized = true;
+    return true;
+}
+
+bool xhci_reset() {
+    // Stop controller first
+    uint32_t cmd = mmio_read32((void*)&xhci.op->usbcmd);
+    cmd &= ~USBCMD_RS;
+    mmio_write32((void*)&xhci.op->usbcmd, cmd);
+    
+    // Wait for halt
+    uint32_t timeout = 100000;
+    while (!(mmio_read32((void*)&xhci.op->usbsts) & USBSTS_HCH) && timeout--) {
+        io_wait();
+    }
+    if (timeout == 0) return false;
+    
+    // Reset controller
+    cmd = mmio_read32((void*)&xhci.op->usbcmd);
+    cmd |= USBCMD_HCRST;
+    mmio_write32((void*)&xhci.op->usbcmd, cmd);
+    
+    // Wait for reset complete
+    timeout = 100000;
+    while ((mmio_read32((void*)&xhci.op->usbcmd) & USBCMD_HCRST) && timeout--) {
+        io_wait();
+    }
+    return timeout > 0;
+}
+
+bool xhci_start() {
+    uint32_t cmd = mmio_read32((void*)&xhci.op->usbcmd);
+    cmd |= USBCMD_RS | USBCMD_INTE;
+    mmio_write32((void*)&xhci.op->usbcmd, cmd);
+    
+    // Wait for running
+    uint32_t timeout = 100000;
+    while ((mmio_read32((void*)&xhci.op->usbsts) & USBSTS_HCH) && timeout--) {
+        io_wait();
+    }
+    return timeout > 0;
+}
+
+void xhci_stop() {
+    uint32_t cmd = mmio_read32((void*)&xhci.op->usbcmd);
+    cmd &= ~USBCMD_RS;
+    mmio_write32((void*)&xhci.op->usbcmd, cmd);
+}
+
+// Ring the doorbell for a slot/endpoint
+static void xhci_ring_doorbell(uint8_t slot_id, uint8_t target) {
+    mmio_write32((void*)&xhci.doorbell[slot_id], target);
+}
+
+// Enqueue a TRB to the command ring
+static void xhci_enqueue_command(Trb* trb) {
+    Trb* dest = &xhci.cmd_ring[xhci.cmd_enqueue];
+    
+    dest->parameter = trb->parameter;
+    dest->status = trb->status;
+    dest->control = (trb->control & ~TRB_CYCLE) | xhci.cmd_cycle;
+    
+    xhci.cmd_enqueue++;
+    
+    // Check for link TRB
+    if (xhci.cmd_enqueue >= XHCI_RING_SIZE - 1) {
+        // Toggle cycle bit in link TRB
+        Trb* link = &xhci.cmd_ring[XHCI_RING_SIZE - 1];
+        link->control ^= TRB_CYCLE;
+        xhci.cmd_cycle ^= 1;
+        xhci.cmd_enqueue = 0;
+    }
+}
+
+// Send a command and wait for completion
+static bool xhci_send_command(Trb* trb, Trb* result) {
+    xhci_enqueue_command(trb);
+    
+    // Memory barrier to ensure TRB is written before doorbell
+    asm volatile("mfence" ::: "memory");
+    
+    xhci_ring_doorbell(0, 0);  // Host controller doorbell
+    return xhci_wait_command_completion(result, 1000);
+}
+
+// Wait for command completion event
+static bool xhci_wait_command_completion(Trb* result, uint32_t timeout_ms) {
+    uint32_t timeout = timeout_ms * 1000;
+    
+    while (timeout--) {
+        Trb* event = &xhci.event_ring[xhci.event_dequeue];
+        uint32_t control = event->control;
+        
+        // Check cycle bit matches expected
+        if ((control & TRB_CYCLE) == xhci.event_cycle) {
+            uint8_t type = TRB_GET_TYPE(control);
+            
+            // Advance dequeue pointer for any event
+            xhci.event_dequeue++;
+            if (xhci.event_dequeue >= XHCI_EVENT_RING_SIZE) {
+                xhci.event_dequeue = 0;
+                xhci.event_cycle ^= 1;
+            }
+            
+            // Update ERDP
+            volatile XhciInterrupterRegs* ir = (volatile XhciInterrupterRegs*)
+                ((uint64_t)xhci.runtime + 0x20);
+            uint64_t erdp = xhci.event_ring_phys + xhci.event_dequeue * sizeof(Trb);
+            mmio_write64((void*)&ir->erdp, erdp | (1 << 3));  // EHB bit
+            
+            if (type == TRB_TYPE_COMMAND_COMPLETION) {
+                if (result) {
+                    result->parameter = event->parameter;
+                    result->status = event->status;
+                    result->control = event->control;
+                }
+                
+                // Check completion code
+                uint8_t comp_code = (event->status >> 24) & 0xFF;
+                return comp_code == TRB_COMP_SUCCESS;
+            }
+            // For other event types (like port status change), continue polling
+        }
+        
+        io_wait();
+    }
+    
+    return false;
+}
+
+// Port operations
+uint8_t xhci_get_port_speed(uint8_t port) {
+    if (port == 0 || port > xhci.max_ports) return 0;
+    uint32_t portsc = mmio_read32((void*)&xhci.ports[port - 1].portsc);
+    return (portsc & PORTSC_SPEED_MASK) >> 10;
+}
+
+bool xhci_port_connected(uint8_t port) {
+    if (port == 0 || port > xhci.max_ports) return false;
+    uint32_t portsc = mmio_read32((void*)&xhci.ports[port - 1].portsc);
+    return (portsc & PORTSC_CCS) != 0;
+}
+
+bool xhci_reset_port(uint8_t port) {
+    if (port == 0 || port > xhci.max_ports) return false;
+    
+    volatile XhciPortRegs* p = &xhci.ports[port - 1];
+    uint32_t portsc = mmio_read32((void*)&p->portsc);
+    
+    // Check if port is connected
+    if (!(portsc & PORTSC_CCS)) return false;
+    
+    // Clear change bits and set reset
+    portsc = (portsc & ~PORTSC_CHANGE_MASK) | PORTSC_PR;
+    mmio_write32((void*)&p->portsc, portsc);
+    
+    // Wait for reset complete (PRC set)
+    uint32_t timeout = 500000;
+    while (timeout--) {
+        portsc = mmio_read32((void*)&p->portsc);
+        if (portsc & PORTSC_PRC) break;
+        io_wait();
+    }
+    if (timeout == 0) return false;
+    
+    // Clear PRC
+    portsc = mmio_read32((void*)&p->portsc);
+    portsc = (portsc & ~PORTSC_CHANGE_MASK) | PORTSC_PRC;
+    mmio_write32((void*)&p->portsc, portsc);
+    
+    // Check if enabled
+    portsc = mmio_read32((void*)&p->portsc);
+    return (portsc & PORTSC_PED) != 0;
+}
+
+// Slot operations
+int xhci_enable_slot() {
+    Trb cmd = {0};
+    cmd.control = TRB_TYPE(TRB_TYPE_ENABLE_SLOT);
+    
+    Trb result;
+    if (!xhci_send_command(&cmd, &result)) {
+        return -1;
+    }
+    
+    // Slot ID is in bits 24-31 of control
+    return (result.control >> 24) & 0xFF;
+}
+
+bool xhci_disable_slot(uint8_t slot_id) {
+    Trb cmd = {0};
+    cmd.control = TRB_TYPE(TRB_TYPE_DISABLE_SLOT) | ((uint32_t)slot_id << 24);
+    
+    Trb result;
+    return xhci_send_command(&cmd, &result);
+}
+
+bool xhci_address_device(uint8_t slot_id, uint8_t port, uint8_t speed) {
+    // Allocate device context - use 64-byte contexts if CSZ is set
+    uint64_t ctx_size = xhci.context_size_64 ? 64 : 32;
+    uint64_t dev_ctx_size = ctx_size * 32;  // Slot + 31 endpoints
+    
+    uint64_t dev_ctx_phys = alloc_page_aligned(dev_ctx_size);
+    if (!dev_ctx_phys) return false;
+    
+    DeviceContext* dev_ctx = (DeviceContext*)vmm_phys_to_virt(dev_ctx_phys);
+    zero_memory(dev_ctx, dev_ctx_size);
+    xhci.device_contexts[slot_id] = dev_ctx;
+    
+    // Point DCBAA to device context
+    xhci.dcbaa[slot_id] = dev_ctx_phys;
+    
+    // Allocate input context - Control context + Slot + 31 endpoints
+    uint64_t input_ctx_size = ctx_size * 33;
+    uint64_t input_ctx_phys = alloc_page_aligned(input_ctx_size);
+    if (!input_ctx_phys) return false;
+    
+    InputContext* input_ctx = (InputContext*)vmm_phys_to_virt(input_ctx_phys);
+    zero_memory(input_ctx, input_ctx_size);
+    xhci.input_contexts[slot_id] = input_ctx;
+    
+    // Setup input control context - add slot context (A0) and EP0 (A1)
+    input_ctx->control.drop_flags = 0;
+    input_ctx->control.add_flags = (1 << 0) | (1 << 1);  // Add slot and EP0
+    
+    // Setup slot context
+    // Bits 0-19: Route String (0 for devices directly connected to root hub)
+    // Bits 20-23: Speed
+    // Bits 27-31: Context Entries (must be 1 for just EP0)
+    uint32_t route_string = 0;  // Direct connection to root hub
+    input_ctx->slot.route_speed_entries = 
+        (route_string & 0xFFFFF) |         // Route string bits 0-19
+        ((uint32_t)speed << 20) |          // Speed bits 20-23
+        (1 << 27);                         // Context entries = 1 (just EP0)
+    
+    // Slot context dword 1: Root Hub Port Number in bits 16-23
+    input_ctx->slot.latency_hub_port = ((uint32_t)port << 16);
+    
+    // Allocate transfer ring for EP0
+    uint64_t tr_size = XHCI_RING_SIZE * sizeof(Trb);
+    uint64_t tr_phys = alloc_page_aligned(tr_size);
+    if (!tr_phys) return false;
+    
+    Trb* tr = (Trb*)vmm_phys_to_virt(tr_phys);
+    zero_memory(tr, tr_size);
+    xhci.transfer_rings[slot_id][0] = tr;
+    xhci.transfer_ring_phys[slot_id][0] = tr_phys;
+    xhci.transfer_enqueue[slot_id][0] = 0;
+    xhci.transfer_cycle[slot_id][0] = 1;
+    
+    // Setup link TRB for transfer ring
+    Trb* link = &tr[XHCI_RING_SIZE - 1];
+    link->parameter = tr_phys;
+    link->status = 0;
+    link->control = TRB_TYPE(TRB_TYPE_LINK) | TRB_TC | 1;  // TC + initial cycle bit
+    
+    // Setup EP0 endpoint context
+    // For control endpoints, max packet size depends on speed
+    uint16_t max_packet;
+    switch (speed) {
+        case PORTSC_SPEED_LS: max_packet = 8; break;
+        case PORTSC_SPEED_FS: max_packet = 8; break;  // Start with 8, get real size from device descriptor
+        case PORTSC_SPEED_HS: max_packet = 64; break;
+        case PORTSC_SPEED_SS: max_packet = 512; break;
+        default: max_packet = 8; break;
+    }
+    
+    // EP0 Context:
+    // ep_state (dword 0): Interval=0 for control, LSA=0, MaxPStreams=0, Mult=0, EPState=0
+    input_ctx->endpoints[0].ep_state = 0;
+    
+    // ep_info (dword 1):
+    // Bits 1-2: CErr (error count) = 3
+    // Bits 3-5: EP Type = 4 (control bidirectional)
+    // Bits 8-15: Max Burst Size = 0
+    // Bits 16-31: Max Packet Size
+    input_ctx->endpoints[0].ep_info = 
+        (3 << 1) |                   // CErr = 3
+        (4 << 3) |                   // EP Type = 4 (control bidirectional)
+        (0 << 8) |                   // Max Burst Size = 0
+        ((uint32_t)max_packet << 16);// Max Packet Size
+    
+    // TR Dequeue pointer with DCS (Dequeue Cycle State) in bit 0
+    input_ctx->endpoints[0].tr_dequeue = tr_phys | 1;  // DCS = 1
+    
+    // Average TRB length - 8 for control transfers
+    input_ctx->endpoints[0].avg_trb_length = 8;
+    
+    // Send Address Device command
+    Trb cmd = {0, 0, 0};
+    cmd.parameter = input_ctx_phys;
+    cmd.control = TRB_TYPE(TRB_TYPE_ADDRESS_DEVICE) | ((uint32_t)slot_id << 24);
+    
+    Trb result;
+    return xhci_send_command(&cmd, &result);
+}
+
+bool xhci_configure_endpoint(uint8_t slot_id, uint8_t ep_num, uint8_t ep_type, 
+                             uint16_t max_packet, uint8_t interval) {
+    if (!xhci.input_contexts[slot_id]) return false;
+    
+    InputContext* input_ctx = xhci.input_contexts[slot_id];
+    
+    // ep_num is the DCI (Device Context Index)
+    // DCI 1 = EP0, DCI 2 = EP1 OUT, DCI 3 = EP1 IN, etc.
+    // endpoints[] array is 0-indexed: endpoints[0] = EP0 = DCI 1
+    // So to access endpoint for DCI N, use endpoints[N-1]
+    uint8_t dci = ep_num;
+    uint8_t ep_ctx_idx = dci - 1;  // Array index into endpoints[]
+    
+    // Clear input context
+    input_ctx->control.drop_flags = 0;
+    // Add flags: bit 0 = slot, bit N = DCI N
+    input_ctx->control.add_flags = (1 << 0) | (1 << dci);
+    
+    // IMPORTANT: Copy current slot context from device context
+    DeviceContext* dev_ctx = xhci.device_contexts[slot_id];
+    input_ctx->slot = dev_ctx->slot;
+    
+    // Update context entries in slot (must be >= DCI of highest endpoint)
+    uint8_t entries = (dev_ctx->slot.route_speed_entries >> 27) & 0x1F;
+    if (dci > entries) {
+        input_ctx->slot.route_speed_entries = 
+            (dev_ctx->slot.route_speed_entries & 0x07FFFFFF) | 
+            ((uint32_t)dci << 27);
+    }
+    
+    // Allocate transfer ring for this endpoint (indexed by DCI for array)
+    uint64_t tr_size = XHCI_RING_SIZE * sizeof(Trb);
+    uint64_t tr_phys = alloc_page_aligned(tr_size);
+    if (!tr_phys) return false;
+    
+    Trb* tr = (Trb*)vmm_phys_to_virt(tr_phys);
+    zero_memory(tr, tr_size);
+    xhci.transfer_rings[slot_id][dci] = tr;
+    xhci.transfer_ring_phys[slot_id][dci] = tr_phys;
+    xhci.transfer_enqueue[slot_id][dci] = 0;
+    xhci.transfer_cycle[slot_id][dci] = 1;
+    
+    // Setup link TRB
+    Trb* link = &tr[XHCI_RING_SIZE - 1];
+    link->parameter = tr_phys;
+    link->status = 0;
+    link->control = TRB_TYPE(TRB_TYPE_LINK) | TRB_TC | 1;  // TC + cycle bit
+    
+    // Setup endpoint context (use ep_ctx_idx for array access)
+    input_ctx->endpoints[ep_ctx_idx].ep_state = 
+        ((uint32_t)interval << 16);  // Interval
+    input_ctx->endpoints[ep_ctx_idx].ep_info = 
+        ((uint32_t)max_packet << 16) | 
+        ((uint32_t)ep_type << 3) |
+        (3 << 1);  // CErr = 3
+    input_ctx->endpoints[ep_ctx_idx].tr_dequeue = 
+        tr_phys | xhci.transfer_cycle[slot_id][dci];
+    input_ctx->endpoints[ep_ctx_idx].avg_trb_length = max_packet;
+    
+    // Get input context physical address
+    uint64_t input_ctx_phys = (uint64_t)input_ctx - vmm_phys_to_virt(0);
+    
+    // Send Configure Endpoint command
+    Trb cmd = {0};
+    cmd.parameter = input_ctx_phys;
+    cmd.control = TRB_TYPE(TRB_TYPE_CONFIG_EP) | ((uint32_t)slot_id << 24);
+    
+    Trb result;
+    return xhci_send_command(&cmd, &result);
+}
+
+// Enqueue a TRB to a transfer ring
+static void xhci_enqueue_transfer(uint8_t slot_id, uint8_t ep_index, Trb* trb) {
+    Trb* ring = xhci.transfer_rings[slot_id][ep_index];
+    uint32_t idx = xhci.transfer_enqueue[slot_id][ep_index];
+    uint8_t cycle = xhci.transfer_cycle[slot_id][ep_index];
+    
+    Trb* dest = &ring[idx];
+    dest->parameter = trb->parameter;
+    dest->status = trb->status;
+    dest->control = (trb->control & ~TRB_CYCLE) | cycle;
+    
+    xhci.transfer_enqueue[slot_id][ep_index]++;
+    
+    // Check for link TRB
+    if (xhci.transfer_enqueue[slot_id][ep_index] >= XHCI_RING_SIZE - 1) {
+        Trb* link = &ring[XHCI_RING_SIZE - 1];
+        link->control ^= TRB_CYCLE;
+        xhci.transfer_cycle[slot_id][ep_index] ^= 1;
+        xhci.transfer_enqueue[slot_id][ep_index] = 0;
+    }
+}
+
+// Wait for a transfer event (timeout is number of iterations, not ms)
+static bool xhci_wait_transfer_event(uint8_t slot_id, Trb* result, uint32_t iterations) {
+    uint32_t timeout = iterations;
+    
+    while (timeout--) {
+        Trb* event = &xhci.event_ring[xhci.event_dequeue];
+        uint32_t control = event->control;
+        
+        if ((control & TRB_CYCLE) == xhci.event_cycle) {
+            uint8_t type = TRB_GET_TYPE(control);
+            
+            // Advance dequeue for ANY matching event
+            xhci.event_dequeue++;
+            if (xhci.event_dequeue >= XHCI_EVENT_RING_SIZE) {
+                xhci.event_dequeue = 0;
+                xhci.event_cycle ^= 1;
+            }
+            
+            // Update ERDP
+            volatile XhciInterrupterRegs* ir = (volatile XhciInterrupterRegs*)
+                ((uint64_t)xhci.runtime + 0x20);
+            uint64_t erdp = xhci.event_ring_phys + xhci.event_dequeue * sizeof(Trb);
+            mmio_write64((void*)&ir->erdp, erdp | (1 << 3));
+            
+            if (type == TRB_TYPE_TRANSFER_EVENT) {
+                if (result) {
+                    result->parameter = event->parameter;
+                    result->status = event->status;
+                    result->control = event->control;
+                }
+                
+                uint8_t comp_code = (event->status >> 24) & 0xFF;
+                return comp_code == TRB_COMP_SUCCESS || comp_code == TRB_COMP_SHORT_PACKET;
+            }
+            // For non-transfer events, continue polling (event was consumed)
+        }
+        
+        io_wait();
+    }
+    
+    return false;
+}
+
+// Control transfer
+bool xhci_control_transfer(uint8_t slot_id, uint8_t request_type, uint8_t request,
+                          uint16_t value, uint16_t index, uint16_t length,
+                          void* data, uint16_t* transferred) {
+    if (!xhci.transfer_rings[slot_id][0]) return false;
+    
+    // Data buffer physical address
+    uint64_t data_phys = 0;
+    if (data && length > 0) {
+        data_phys = alloc_page_aligned(length);
+        if (!data_phys) return false;
+        
+        // Copy data for OUT transfers
+        if (!(request_type & 0x80)) {
+            uint8_t* src = (uint8_t*)data;
+            uint8_t* dst = (uint8_t*)vmm_phys_to_virt(data_phys);
+            for (uint16_t i = 0; i < length; i++) {
+                dst[i] = src[i];
+            }
+        }
+    }
+    
+    // Setup Stage TRB
+    Trb setup = {0};
+    setup.parameter = 
+        ((uint64_t)request_type) |
+        ((uint64_t)request << 8) |
+        ((uint64_t)value << 16) |
+        ((uint64_t)index << 32) |
+        ((uint64_t)length << 48);
+    setup.status = 8;  // TRB transfer length = 8 (setup packet size)
+    setup.control = TRB_TYPE(TRB_TYPE_SETUP) | TRB_IDT;  // Immediate Data
+    if (length > 0) {
+        setup.control |= (request_type & 0x80) ? (3 << 16) : (2 << 16);  // TRT field
+    }
+    xhci_enqueue_transfer(slot_id, 0, &setup);
+    
+    // Data Stage TRB (if needed)
+    if (length > 0) {
+        Trb data_trb = {0};
+        data_trb.parameter = data_phys;
+        data_trb.status = length;
+        data_trb.control = TRB_TYPE(TRB_TYPE_DATA);
+        if (request_type & 0x80) {
+            data_trb.control |= TRB_DIR_IN;
+        }
+        xhci_enqueue_transfer(slot_id, 0, &data_trb);
+    }
+    
+    // Status Stage TRB
+    Trb status_trb = {0};
+    status_trb.control = TRB_TYPE(TRB_TYPE_STATUS) | TRB_IOC;
+    // Direction is opposite of data stage (or IN if no data)
+    if (!(request_type & 0x80) || length == 0) {
+        status_trb.control |= TRB_DIR_IN;
+    }
+    xhci_enqueue_transfer(slot_id, 0, &status_trb);
+    
+    // Ring doorbell (EP0 = target 1)
+    xhci_ring_doorbell(slot_id, 1);
+    
+    // Wait for completion
+    Trb result;
+    if (!xhci_wait_transfer_event(slot_id, &result, 500)) {
+        return false;
+    }
+    
+    // Copy data for IN transfers
+    if (data && length > 0 && (request_type & 0x80)) {
+        uint8_t* src = (uint8_t*)vmm_phys_to_virt(data_phys);
+        uint8_t* dst = (uint8_t*)data;
+        uint32_t actual_len = length - (result.status & 0xFFFFFF);
+        for (uint32_t i = 0; i < actual_len; i++) {
+            dst[i] = src[i];
+        }
+        if (transferred) *transferred = actual_len;
+    }
+    
+    return true;
+}
+
+// Static interrupt transfer buffers - one per slot/endpoint
+static uint64_t intr_buffer_phys[32][32] = {0};
+// Track pending interrupt transfers - true if TRB posted but not completed
+static bool intr_pending[32][32] = {false};
+
+// Interrupt transfer - non-blocking with pending state tracking
+bool xhci_interrupt_transfer(uint8_t slot_id, uint8_t ep_num, void* data, 
+                             uint16_t length, uint16_t* transferred) {
+    if (!xhci.transfer_rings[slot_id][ep_num]) return false;
+    
+    // Allocate buffer once per endpoint (reuse on subsequent calls)
+    if (intr_buffer_phys[slot_id][ep_num] == 0) {
+        intr_buffer_phys[slot_id][ep_num] = alloc_page_aligned(64);
+        if (!intr_buffer_phys[slot_id][ep_num]) return false;
+    }
+    uint64_t data_phys = intr_buffer_phys[slot_id][ep_num];
+    
+    // If no pending transfer, post a new TRB
+    if (!intr_pending[slot_id][ep_num]) {
+        Trb trb = {0, 0, 0};
+        trb.parameter = data_phys;
+        trb.status = length;
+        trb.control = TRB_TYPE(TRB_TYPE_NORMAL) | TRB_IOC | TRB_ISP;
+        xhci_enqueue_transfer(slot_id, ep_num, &trb);
+        
+        asm volatile("mfence" ::: "memory");
+        xhci_ring_doorbell(slot_id, ep_num);
+        intr_pending[slot_id][ep_num] = true;
+    }
+    
+    // Check for completion (non-blocking - just check once)
+    Trb* event = &xhci.event_ring[xhci.event_dequeue];
+    uint32_t control = event->control;
+    
+    if ((control & TRB_CYCLE) != xhci.event_cycle) {
+        // No event ready
+        return false;
+    }
+    
+    uint8_t type = TRB_GET_TYPE(control);
+    
+    // For transfer events, verify it's for OUR slot+endpoint before consuming
+    if (type == TRB_TYPE_TRANSFER_EVENT) {
+        uint8_t event_slot = (control >> 24) & 0xFF;
+        uint8_t event_ep = (control >> 16) & 0x1F;
+        
+        if (event_slot != slot_id || event_ep != ep_num) {
+            // This event is for a different device - don't consume it
+            return false;
+        }
+    }
+    
+    // Consume the event (either our transfer event or non-transfer event)
+    Trb result = *event;
+    xhci.event_dequeue++;
+    if (xhci.event_dequeue >= XHCI_EVENT_RING_SIZE) {
+        xhci.event_dequeue = 0;
+        xhci.event_cycle ^= 1;
+    }
+    volatile XhciInterrupterRegs* ir = (volatile XhciInterrupterRegs*)
+        ((uint64_t)xhci.runtime + 0x20);
+    uint64_t erdp = xhci.event_ring_phys + xhci.event_dequeue * sizeof(Trb);
+    mmio_write64((void*)&ir->erdp, erdp | (1 << 3));
+    
+    if (type != TRB_TYPE_TRANSFER_EVENT) {
+        // Not a transfer event - keep pending, try again later
+        return false;
+    }
+    
+    // Transfer completed - clear pending
+    intr_pending[slot_id][ep_num] = false;
+    
+    uint8_t comp_code = (result.status >> 24) & 0xFF;
+    if (comp_code != TRB_COMP_SUCCESS && comp_code != TRB_COMP_SHORT_PACKET) {
+        return false;
+    }
+    
+    // Copy data
+    uint8_t* src = (uint8_t*)vmm_phys_to_virt(data_phys);
+    uint8_t* dst = (uint8_t*)data;
+    uint32_t actual_len = length - (result.status & 0xFFFFFF);
+    for (uint32_t i = 0; i < actual_len; i++) {
+        dst[i] = src[i];
+    }
+    if (transferred) *transferred = actual_len;
+    
+    return true;
+}
+
+// Poll for events (non-blocking)
+void xhci_poll_events() {
+    while (true) {
+        Trb* event = &xhci.event_ring[xhci.event_dequeue];
+        uint32_t control = event->control;
+        
+        
+        if ((control & TRB_CYCLE) != xhci.event_cycle) {
+            break;  // No more events
+        }
+        
+        uint8_t type = TRB_GET_TYPE(control);
+        
+        // Handle different event types
+        if (type == TRB_TYPE_PORT_STATUS_CHANGE) {
+            // Port status changed - could handle hot-plug here
+        }
+        
+        // Advance dequeue
+        xhci.event_dequeue++;
+        if (xhci.event_dequeue >= XHCI_EVENT_RING_SIZE) {
+            xhci.event_dequeue = 0;
+            xhci.event_cycle ^= 1;
+        }
+        
+        // Update ERDP
+        volatile XhciInterrupterRegs* ir = (volatile XhciInterrupterRegs*)
+            ((uint64_t)xhci.runtime + 0x20);
+        uint64_t erdp = xhci.event_ring_phys + xhci.event_dequeue * sizeof(Trb);
+        mmio_write64((void*)&ir->erdp, erdp | (1 << 3));
+    }
+}
+
+bool xhci_wait_for_event(uint32_t timeout_ms) {
+    uint32_t timeout = timeout_ms * 1000;
+    
+    while (timeout--) {
+        Trb* event = &xhci.event_ring[xhci.event_dequeue];
+        if ((event->control & TRB_CYCLE) == xhci.event_cycle) {
+            return true;
+        }
+        io_wait();
+    }
+    
+    return false;
+}
+
+void xhci_dump_status() {
+    // This would print debug info - not implemented for now
+}

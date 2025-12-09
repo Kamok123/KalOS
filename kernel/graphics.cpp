@@ -80,3 +80,85 @@ void gfx_draw_cursor(int32_t x, int32_t y) {
         }
     }
 }
+#include "font.h"
+
+void gfx_draw_char(int32_t x, int32_t y, char c, uint32_t color) {
+    if (c < 0 || c > 127) return;
+    const uint8_t *glyph = font8x8[(int)c];
+    for (int row = 0; row < 8; row++) {
+        for (int col = 0; col < 8; col++) {
+            if ((glyph[row] >> (7 - col)) & 1) {
+                gfx_put_pixel(x + col, y + row, color);
+            }
+        }
+    }
+}
+
+void gfx_clear_char(int32_t x, int32_t y, uint32_t bg_color) {
+    for (int row = 0; row < 8; row++) {
+        for (int col = 0; col < 9; col++) {
+            gfx_put_pixel(x + col, y + row, bg_color);
+        }
+    }
+}
+
+void gfx_draw_string(int32_t x, int32_t y, const char *str, uint32_t color) {
+    int32_t cursor_x = x;
+    int32_t cursor_y = y;
+    while (*str) {
+        if (*str == '\n') {
+            cursor_x = x;
+            cursor_y += 10;
+        } else {
+            gfx_draw_char(cursor_x, cursor_y, *str, color);
+            cursor_x += 9;
+        }
+        str++;
+    }
+}
+
+void gfx_draw_centered_text(const char* text, uint32_t color) {
+    if (!framebuffer) return;
+    
+    int text_len = 0;
+    const char* p = text;
+    while (*p++) text_len++;
+    
+    int char_width = 8; // Assuming 8x16 font (actually 8x8 in draw_char but let's stick to what works)
+    int text_width = text_len * char_width;
+    int center_x = (framebuffer->width - text_width) / 2;
+    int center_y = (framebuffer->height - 16) / 2;
+    
+    gfx_draw_string(center_x, center_y, text, color);
+}
+
+void gfx_scroll_up(int pixels, uint32_t fill_color) {
+    if (!framebuffer) return;
+    
+    uint32_t* fb = (uint32_t*)framebuffer->address;
+    uint64_t pitch = framebuffer->pitch / 4;
+    uint64_t width = framebuffer->width;
+    uint64_t height = framebuffer->height;
+    
+    // Move everything up
+    for (uint64_t y = pixels; y < height; y++) {
+        for (uint64_t x = 0; x < width; x++) {
+            fb[(y - pixels) * pitch + x] = fb[y * pitch + x];
+        }
+    }
+    
+    // Clear last lines
+    for (uint64_t y = height - pixels; y < height; y++) {
+        for (uint64_t x = 0; x < width; x++) {
+            fb[y * pitch + x] = fill_color;
+        }
+    }
+}
+
+uint64_t gfx_get_width() {
+    return framebuffer ? framebuffer->width : 0;
+}
+
+uint64_t gfx_get_height() {
+    return framebuffer ? framebuffer->height : 0;
+}

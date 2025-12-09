@@ -9,6 +9,13 @@ void gfx_put_pixel(int32_t x, int32_t y, uint32_t color);
 void gfx_fill_rect(int32_t x, int32_t y, int32_t w, int32_t h, uint32_t color);
 void gfx_draw_rect(int32_t x, int32_t y, int32_t w, int32_t h, uint32_t color);
 void gfx_draw_cursor(int32_t x, int32_t y);
+void gfx_draw_char(int32_t x, int32_t y, char c, uint32_t color);
+void gfx_clear_char(int32_t x, int32_t y, uint32_t bg_color);
+void gfx_draw_string(int32_t x, int32_t y, const char *str, uint32_t color);
+void gfx_draw_centered_text(const char* text, uint32_t color);
+void gfx_scroll_up(int pixels, uint32_t fill_color);
+uint64_t gfx_get_width();
+uint64_t gfx_get_height();
 
 // Colors
 #define COLOR_BLACK       0x000000

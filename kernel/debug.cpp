@@ -1,13 +1,11 @@
 #include "debug.h"
+#include "graphics.h"
 #include <stdarg.h>
 
 static struct limine_framebuffer* debug_fb = nullptr;
 static uint64_t debug_x = 50;
 static uint64_t debug_y = 50;
-static uint32_t current_color = 0xFFFFFF;
-
-extern void draw_char(struct limine_framebuffer *fb, uint64_t x, uint64_t y, char c, uint32_t color);
-extern void draw_string(struct limine_framebuffer *fb, uint64_t x, uint64_t y, const char *str, uint32_t color);
+static uint32_t current_color = COLOR_WHITE;
 
 void debug_init(struct limine_framebuffer* fb) {
     debug_fb = fb;
@@ -21,13 +19,13 @@ static void debug_putchar(char c) {
     if (c == '\n') {
         debug_x = 50;
         debug_y += 10;
-        if (debug_y >= debug_fb->height - 40) {
+        if (debug_y >= gfx_get_height() - 40) {
             debug_y = 50;  // Wrap around
         }
     } else {
-        draw_char(debug_fb, debug_x, debug_y, c, current_color);
+        gfx_draw_char(debug_x, debug_y, c, current_color);
         debug_x += 9;
-        if (debug_x >= debug_fb->width - 50) {
+        if (debug_x >= gfx_get_width() - 50) {
             debug_x = 50;
             debug_y += 10;
         }
@@ -90,7 +88,7 @@ void kprintf(const char* fmt, ...) {
     va_list args;
     va_start(args, fmt);
     
-    current_color = 0xFFFFFF;
+    current_color = COLOR_WHITE;
     
     while (*fmt) {
         if (*fmt == '%') {
@@ -203,18 +201,11 @@ void kprintf_color(uint32_t color, const char* fmt, ...) {
 
 void panic(const char* message) {
     // Red background for panic
-    if (debug_fb) {
-        uint32_t* fb = (uint32_t*)debug_fb->address;
-        for (uint64_t y = 0; y < debug_fb->height; y++) {
-            for (uint64_t x = 0; x < debug_fb->width; x++) {
-                fb[y * (debug_fb->pitch / 4) + x] = 0x550000;
-            }
-        }
-    }
+    gfx_clear(0x550000);
     
     debug_x = 50;
     debug_y = 100;
-    current_color = 0xFFFFFF;
+    current_color = COLOR_WHITE;
     
     debug_puts("=== KERNEL PANIC ===\n\n");
     debug_puts(message);
