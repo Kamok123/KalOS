@@ -281,7 +281,7 @@ extern "C" void _start(void) {
     
     // Initialize serial console for debug output
     serial_init();
-    serial_puts("\r\n=== uniOS Kernel v0.2.3 ===\r\n");
+    serial_puts("\r\n=== uniOS Kernel v0.2.4 ===\r\n");
     
     // Get bootloader info if available
     if (bootloader_info_request.response) {
@@ -290,7 +290,7 @@ extern "C" void _start(void) {
         serial_printf("Bootloader: %s %s\r\n", g_bootloader_name, g_bootloader_version);
     }
     
-    DEBUG_INFO("uniOS Kernel v0.2.3 Starting...");
+    DEBUG_INFO("uniOS Kernel v0.2.4 Starting...");
     DEBUG_INFO("Framebuffer: %dx%d bpp=%d", fb->width, fb->height, fb->bpp);
 
     // Initialize core systems
@@ -369,7 +369,13 @@ extern "C" void _start(void) {
     // Splash screen
     gfx_clear(COLOR_BLACK);
     gfx_draw_centered_text("uniOS", COLOR_WHITE);
-    for (volatile int i = 0; i < 50000000; i++) { }
+    gfx_draw_centered_text("uniOS", COLOR_WHITE);
+    // Wait ~0.5 seconds but keep polling input to avoid buffer overflows
+    uint64_t splash_start = timer_get_ticks();
+    while (timer_get_ticks() - splash_start < 50) {
+        input_poll();
+        asm volatile("hlt");
+    }
     
     // Clear screen again
     gfx_clear(COLOR_BLACK);

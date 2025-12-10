@@ -276,9 +276,10 @@ void usb_hid_init() {
                 }
             }
             
-            // SET_IDLE is generally safe for all HID devices
+            // SET_IDLE to 100ms (25 * 4ms) to ensure we get periodic reports
+            // This helps recover if a "key up" packet is missed
             if (dev->hid_endpoint != 0) {
-                set_idle(dev, 0);
+                set_idle(dev, 25);
             }
         }
         

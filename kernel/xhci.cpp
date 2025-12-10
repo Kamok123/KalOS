@@ -6,6 +6,7 @@
 #include "heap.h"
 #include "usb.h" 
 #include "debug.h"
+#include "timer.h"
 #include <stddef.h>
 
 // Global xHCI controller instance
@@ -282,6 +283,7 @@ bool xhci_init() {
             xhci.transfer_rings[i][j] = nullptr;
             xhci.intr_pending[i][j] = false;
             xhci.intr_complete[i][j] = false;
+            xhci.intr_start_time[i][j] = 0;
         }
     }
     
@@ -397,9 +399,10 @@ static void xhci_enqueue_command(Trb* trb) {
     
     // Check for link TRB
     if (xhci.cmd_enqueue >= XHCI_RING_SIZE - 1) {
-        // Toggle cycle bit in link TRB
+        // Link TRB must have the CURRENT cycle bit to be executed
         Trb* link = &xhci.cmd_ring[XHCI_RING_SIZE - 1];
-        link->control ^= TRB_CYCLE;
+        link->control = (link->control & ~TRB_CYCLE) | xhci.cmd_cycle;
+        
         xhci.cmd_cycle ^= 1;
         xhci.cmd_enqueue = 0;
     }
@@ -737,7 +740,9 @@ static void xhci_enqueue_transfer(uint8_t slot_id, uint8_t ep_index, Trb* trb) {
     // If we are at the last TRB (Link TRB), we must toggle its cycle bit and wrap
     if (idx == XHCI_RING_SIZE - 1) {
         Trb* link = &ring[idx];
-        link->control ^= TRB_CYCLE;
+        // Link TRB must have the CURRENT cycle bit to be executed
+        uint8_t current_cycle = xhci.transfer_cycle[slot_id][ep_index];
+        link->control = (link->control & ~TRB_CYCLE) | current_cycle;
         cache_flush(link); // Ensure Link TRB update is visible
         
         xhci.transfer_cycle[slot_id][ep_index] ^= 1;
@@ -928,7 +933,16 @@ bool xhci_interrupt_transfer(uint8_t slot_id, uint8_t ep_num, void* data,
     
     // Check if transfer is still pending
     if (xhci.intr_pending[slot_id][ep_num]) {
-        return false;
+        // Check for timeout (e.g. 500ms)
+        uint64_t now = timer_get_ticks();
+        // 100Hz timer = 10ms per tick. 50 ticks = 500ms.
+        if (now - xhci.intr_start_time[slot_id][ep_num] > 50) {
+            if (xhci_debug) DEBUG_LOG("EP %d.%d timed out, resetting pending state", slot_id, ep_num);
+            xhci.intr_pending[slot_id][ep_num] = false;
+            // Fall through to queue new transfer
+        } else {
+            return false;
+        }
     }
     
     // Start new transfer
@@ -952,16 +966,18 @@ bool xhci_interrupt_transfer(uint8_t slot_id, uint8_t ep_num, void* data,
     asm volatile("mfence" ::: "memory");
     xhci_ring_doorbell(slot_id, ep_num);
     xhci.intr_pending[slot_id][ep_num] = true;
+    xhci.intr_start_time[slot_id][ep_num] = timer_get_ticks();
     
     return false;
 }
 
 // Poll for events (non-blocking) - Central Event Dispatcher
 void xhci_poll_events() {
-    // Process up to 16 events per call to avoid starving other tasks
+    // Process up to 64 events per call to avoid starving other tasks
+    // Increased from 16 to handle high-rate mouse updates better
     int count = 0;
     
-    while (count++ < 16) {
+    while (count++ < 64) {
         Trb* event = &xhci.event_ring[xhci.event_dequeue];
         uint32_t control = event->control;
         

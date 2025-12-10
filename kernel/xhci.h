@@ -283,6 +283,7 @@ struct XhciController {
     // Interrupt transfer state
     bool intr_pending[256][32];     // Transfer started, waiting for completion
     bool intr_complete[256][32];    // Transfer completed, result available
+    uint64_t intr_start_time[256][32]; // Time when transfer was started (for timeout)
     Trb transfer_result[256][32];   // Result of completed transfer
 };
 
