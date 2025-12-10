@@ -44,6 +44,7 @@ static volatile LIMINE_REQUESTS_END_MARKER;
 #include "graphics.h"
 #include "input.h"
 #include "acpi.h"
+#include "rtc.h"
 
 // Global framebuffer pointer
 struct limine_framebuffer* g_framebuffer = nullptr;
@@ -180,7 +181,7 @@ extern "C" void _start(void) {
     // Clear screen
     gfx_clear(COLOR_BLACK);
     
-    DEBUG_INFO("uniOS Kernel v0.2 Starting...");
+    DEBUG_INFO("uniOS Kernel v0.2.1 Starting...");
     DEBUG_INFO("Framebuffer: %dx%d bpp=%d", fb->width, fb->height, fb->bpp);
 
     // Initialize core systems
@@ -222,6 +223,9 @@ extern "C" void _start(void) {
     
     acpi_init();  // Initialize ACPI for poweroff support
     DEBUG_INFO("ACPI Initialized");
+    
+    rtc_init();  // Initialize RTC for date/time
+    DEBUG_INFO("RTC Initialized");
     
     usb_init();
     // usb_init logs its own status

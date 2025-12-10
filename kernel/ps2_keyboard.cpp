@@ -9,9 +9,16 @@ static char kb_buffer[KB_BUFFER_SIZE];
 static volatile uint8_t kb_buffer_start = 0;
 static volatile uint8_t kb_buffer_end = 0;
 
-// Shift state
+// Modifier states
 static uint8_t shift_held = 0;
 static uint8_t caps_lock = 0;
+static uint8_t extended_scancode = 0;  // For 0xE0 prefixed scancodes
+
+// Special key codes for arrow keys (match shell.cpp definitions)
+#define KEY_UP_ARROW    0x80
+#define KEY_DOWN_ARROW  0x81
+#define KEY_LEFT_ARROW  0x82
+#define KEY_RIGHT_ARROW 0x83
 
 // US keyboard layout (lowercase)
 static const char scancode_to_ascii[128] = {
@@ -37,6 +44,14 @@ static const char scancode_to_ascii_shift[128] = {
     0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
 };
 
+static void push_char(char c) {
+    uint8_t next = (kb_buffer_end + 1) % KB_BUFFER_SIZE;
+    if (next != kb_buffer_start) {
+        kb_buffer[kb_buffer_end] = c;
+        kb_buffer_end = next;
+    }
+}
+
 void ps2_keyboard_init() {
     // Flush any pending data in the keyboard buffer
     while (inb(KEYBOARD_STATUS_PORT) & 0x01) {
@@ -48,7 +63,32 @@ void ps2_keyboard_init() {
 void ps2_keyboard_handler() {
     uint8_t scancode = inb(KEYBOARD_DATA_PORT);
     
-    // Key release
+    // Handle extended scancode prefix
+    if (scancode == 0xE0) {
+        extended_scancode = 1;
+        return;
+    }
+    
+    // Handle extended scancodes (arrow keys, etc.)
+    if (extended_scancode) {
+        extended_scancode = 0;
+        
+        // Key release for extended keys
+        if (scancode & 0x80) {
+            return;  // Ignore key release for arrow keys
+        }
+        
+        // Extended key press
+        switch (scancode) {
+            case 0x48: push_char(KEY_UP_ARROW); return;    // Up arrow
+            case 0x50: push_char(KEY_DOWN_ARROW); return;  // Down arrow
+            case 0x4B: push_char(KEY_LEFT_ARROW); return;  // Left arrow
+            case 0x4D: push_char(KEY_RIGHT_ARROW); return; // Right arrow
+            default: return;  // Unknown extended key
+        }
+    }
+    
+    // Key release (standard keys)
     if (scancode & 0x80) {
         uint8_t released = scancode & 0x7F;
         if (released == 0x2A || released == 0x36) { // Left/Right Shift
@@ -57,7 +97,7 @@ void ps2_keyboard_handler() {
         return;
     }
     
-    // Key press
+    // Key press (standard keys)
     if (scancode == 0x2A || scancode == 0x36) { // Left/Right Shift
         shift_held = 1;
         return;
@@ -85,11 +125,7 @@ void ps2_keyboard_handler() {
     }
     
     if (c != 0) {
-        uint8_t next = (kb_buffer_end + 1) % KB_BUFFER_SIZE;
-        if (next != kb_buffer_start) {
-            kb_buffer[kb_buffer_end] = c;
-            kb_buffer_end = next;
-        }
+        push_char(c);
     }
 }
 
@@ -105,3 +141,4 @@ char ps2_keyboard_get_char() {
     kb_buffer_start = (kb_buffer_start + 1) % KB_BUFFER_SIZE;
     return c;
 }
+

@@ -7,17 +7,23 @@
 #include "acpi.h"
 #include "timer.h"
 #include "input.h"
+#include "rtc.h"
+#include "pci.h"
 #include <stddef.h>
 
 static char cmd_buffer[256];
 static int cmd_len = 0;
 static int cursor_pos = 0; // Position within cmd_buffer
 
-// Special key codes
-#define KEY_RIGHT 1
-#define KEY_LEFT  2
-#define KEY_DOWN  3
-#define KEY_UP    4
+// Command history
+#define HISTORY_SIZE 10
+static char history[HISTORY_SIZE][256];
+static int history_count = 0;
+static int history_index = -1;  // Current browsing position (-1 = not browsing)
+
+// Special key codes (sent by input layer via escape sequences)
+#define KEY_UP_ARROW    0x80
+#define KEY_DOWN_ARROW  0x81
 
 extern "C" void jump_to_user_mode(uint64_t code_sel, uint64_t stack, uint64_t entry);
 
@@ -32,12 +38,58 @@ static int strncmp(const char* s1, const char* s2, size_t n) {
     return *(const unsigned char*)s1 - *(const unsigned char*)s2;
 }
 
+static size_t strlen(const char* s) {
+    size_t len = 0;
+    while (*s++) len++;
+    return len;
+}
+
+static void strcpy(char* dst, const char* src) {
+    while ((*dst++ = *src++));
+}
+
+static void add_to_history(const char* cmd) {
+    if (cmd[0] == '\0') return;  // Don't add empty commands
+    
+    // Don't add if same as last command
+    if (history_count > 0 && strcmp(history[(history_count - 1) % HISTORY_SIZE], cmd) == 0) {
+        return;
+    }
+    
+    strcpy(history[history_count % HISTORY_SIZE], cmd);
+    history_count++;
+}
+
+static void clear_line() {
+    // Clear current input from display
+    while (cursor_pos > 0) {
+        g_terminal.put_char('\b');
+        cursor_pos--;
+    }
+    cmd_len = 0;
+}
+
+static void display_line() {
+    // Display current buffer
+    for (int i = 0; i < cmd_len; i++) {
+        g_terminal.put_char(cmd_buffer[i]);
+    }
+    cursor_pos = cmd_len;
+}
+
 static void cmd_help() {
     g_terminal.write_line("Commands:");
     g_terminal.write_line("  help      - Show this help");
     g_terminal.write_line("  ls        - List files");
     g_terminal.write_line("  cat <f>   - Show file contents");
+    g_terminal.write_line("  echo <t>  - Print text");
     g_terminal.write_line("  mem       - Show memory usage");
+    g_terminal.write_line("  date      - Show current date/time");
+    g_terminal.write_line("  uptime    - Show system uptime");
+    g_terminal.write_line("  version   - Show kernel version");
+    g_terminal.write_line("  uname     - System information");
+    g_terminal.write_line("  cpuinfo   - CPU information");
+    g_terminal.write_line("  lspci     - List PCI devices");
     g_terminal.write_line("  clear     - Clear screen");
     g_terminal.write_line("  gui       - Start GUI mode");
     g_terminal.write_line("  reboot    - Reboot system");
@@ -107,8 +159,212 @@ static void cmd_mem() {
     g_terminal.write(buf);
 }
 
+static void cmd_date() {
+    RTCTime time;
+    rtc_get_time(&time);
+    
+    char buf[64];
+    int i = 0;
+    
+    auto append_num2 = [&](int n) {
+        buf[i++] = '0' + (n / 10);
+        buf[i++] = '0' + (n % 10);
+    };
+    
+    auto append_num4 = [&](int n) {
+        buf[i++] = '0' + (n / 1000);
+        buf[i++] = '0' + ((n / 100) % 10);
+        buf[i++] = '0' + ((n / 10) % 10);
+        buf[i++] = '0' + (n % 10);
+    };
+    
+    // Format: YYYY-MM-DD HH:MM:SS
+    append_num4(time.year);
+    buf[i++] = '-';
+    append_num2(time.month);
+    buf[i++] = '-';
+    append_num2(time.day);
+    buf[i++] = ' ';
+    append_num2(time.hour);
+    buf[i++] = ':';
+    append_num2(time.minute);
+    buf[i++] = ':';
+    append_num2(time.second);
+    buf[i] = 0;
+    
+    g_terminal.write_line(buf);
+}
+
+static void cmd_uptime() {
+    uint64_t seconds = rtc_get_uptime_seconds();
+    uint64_t minutes = seconds / 60;
+    uint64_t hours = minutes / 60;
+    uint64_t days = hours / 24;
+    
+    char buf[64];
+    int i = 0;
+    
+    auto append_str = [&](const char* s) {
+        while (*s) buf[i++] = *s++;
+    };
+    
+    auto append_num = [&](uint64_t n) {
+        if (n == 0) { buf[i++] = '0'; return; }
+        char tmp[20]; int j = 0;
+        while (n > 0) { tmp[j++] = '0' + (n % 10); n /= 10; }
+        while (j > 0) buf[i++] = tmp[--j];
+    };
+    
+    append_str("up ");
+    if (days > 0) { append_num(days); append_str(" day(s), "); }
+    append_num(hours % 24); append_str(":");
+    if ((minutes % 60) < 10) buf[i++] = '0';
+    append_num(minutes % 60); append_str(":");
+    if ((seconds % 60) < 10) buf[i++] = '0';
+    append_num(seconds % 60);
+    buf[i] = 0;
+    
+    g_terminal.write_line(buf);
+}
+
+static void cmd_echo(const char* text) {
+    g_terminal.write_line(text);
+}
+
+static void cmd_version() {
+    g_terminal.write_line("uniOS Kernel v0.2.1");
+    g_terminal.write_line("Built with GCC for x86_64-elf");
+    g_terminal.write_line("Bootloader: Limine v8.x");
+}
+
+static void cmd_uname() {
+    g_terminal.write_line("uniOS 0.2.1 x86_64");
+}
+
+static void cmd_cpuinfo() {
+    uint32_t eax, ebx, ecx, edx;
+    char vendor[13];
+    
+    // Get vendor string
+    asm volatile("cpuid" : "=a"(eax), "=b"(ebx), "=c"(ecx), "=d"(edx) : "a"(0));
+    *(uint32_t*)&vendor[0] = ebx;
+    *(uint32_t*)&vendor[4] = edx;
+    *(uint32_t*)&vendor[8] = ecx;
+    vendor[12] = 0;
+    
+    g_terminal.write("Vendor: ");
+    g_terminal.write_line(vendor);
+    
+    // Get processor info
+    asm volatile("cpuid" : "=a"(eax), "=b"(ebx), "=c"(ecx), "=d"(edx) : "a"(1));
+    
+    uint32_t family = ((eax >> 8) & 0xF) + ((eax >> 20) & 0xFF);
+    uint32_t model = ((eax >> 4) & 0xF) | (((eax >> 16) & 0xF) << 4);
+    uint32_t stepping = eax & 0xF;
+    
+    char buf[64];
+    int i = 0;
+    
+    auto append_str = [&](const char* s) {
+        while (*s) buf[i++] = *s++;
+    };
+    
+    auto append_num = [&](uint32_t n) {
+        if (n == 0) { buf[i++] = '0'; return; }
+        char tmp[20]; int j = 0;
+        while (n > 0) { tmp[j++] = '0' + (n % 10); n /= 10; }
+        while (j > 0) buf[i++] = tmp[--j];
+    };
+    
+    append_str("Family: "); append_num(family);
+    append_str(", Model: "); append_num(model);
+    append_str(", Stepping: "); append_num(stepping);
+    buf[i] = 0;
+    
+    g_terminal.write_line(buf);
+    
+    // Features
+    g_terminal.write("Features: ");
+    if (edx & (1 << 0)) g_terminal.write("FPU ");
+    if (edx & (1 << 4)) g_terminal.write("TSC ");
+    if (edx & (1 << 5)) g_terminal.write("MSR ");
+    if (edx & (1 << 6)) g_terminal.write("PAE ");
+    if (edx & (1 << 9)) g_terminal.write("APIC ");
+    if (edx & (1 << 23)) g_terminal.write("MMX ");
+    if (edx & (1 << 25)) g_terminal.write("SSE ");
+    if (edx & (1 << 26)) g_terminal.write("SSE2 ");
+    if (ecx & (1 << 0)) g_terminal.write("SSE3 ");
+    if (ecx & (1 << 9)) g_terminal.write("SSSE3 ");
+    if (ecx & (1 << 28)) g_terminal.write("AVX ");
+    g_terminal.write("\n");
+}
+
+static void cmd_lspci() {
+    g_terminal.write_line("PCI Devices:");
+    
+    // Use PCI bus scan from pci.cpp
+    for (uint8_t bus = 0; bus < 8; bus++) {  // Limit to first 8 buses for speed
+        for (uint8_t device = 0; device < 32; device++) {
+            for (uint8_t function = 0; function < 8; function++) {
+                uint16_t vendor = pci_config_read16(bus, device, function, 0x00);
+                if (vendor == 0xFFFF) continue;
+                
+                uint16_t device_id = pci_config_read16(bus, device, function, 0x02);
+                uint8_t class_code = pci_config_read8(bus, device, function, 0x0B);
+                uint8_t subclass = pci_config_read8(bus, device, function, 0x0A);
+                
+                char buf[64];
+                int i = 0;
+                
+                auto append_hex4 = [&](uint16_t v) {
+                    const char* hex = "0123456789ABCDEF";
+                    buf[i++] = hex[(v >> 12) & 0xF];
+                    buf[i++] = hex[(v >> 8) & 0xF];
+                    buf[i++] = hex[(v >> 4) & 0xF];
+                    buf[i++] = hex[v & 0xF];
+                };
+                
+                auto append_hex2 = [&](uint8_t v) {
+                    const char* hex = "0123456789ABCDEF";
+                    buf[i++] = hex[(v >> 4) & 0xF];
+                    buf[i++] = hex[v & 0xF];
+                };
+                
+                auto append_num = [&](uint8_t n) {
+                    if (n >= 100) buf[i++] = '0' + (n / 100);
+                    if (n >= 10) buf[i++] = '0' + ((n / 10) % 10);
+                    buf[i++] = '0' + (n % 10);
+                };
+                
+                // Format: Bus:Dev.Func Vendor:Device [Class:Subclass]
+                append_num(bus); buf[i++] = ':';
+                append_num(device); buf[i++] = '.';
+                append_num(function); buf[i++] = ' ';
+                append_hex4(vendor); buf[i++] = ':';
+                append_hex4(device_id); buf[i++] = ' ';
+                buf[i++] = '['; append_hex2(class_code); buf[i++] = ':';
+                append_hex2(subclass); buf[i++] = ']';
+                buf[i] = 0;
+                
+                g_terminal.write("  ");
+                g_terminal.write_line(buf);
+                
+                // Only check function 0 if not multifunction
+                if (function == 0) {
+                    uint8_t header = pci_config_read8(bus, device, 0, 0x0E);
+                    if (!(header & 0x80)) break;
+                }
+            }
+        }
+    }
+}
+
 static void execute_command() {
     cmd_buffer[cmd_len] = 0;
+    
+    // Add to history before execution
+    add_to_history(cmd_buffer);
+    history_index = -1;  // Reset history browsing
     
     if (cmd_len == 0) {
         g_terminal.write("\n> ");
@@ -125,6 +381,22 @@ static void execute_command() {
         cmd_cat(cmd_buffer + 4);
     } else if (strcmp(cmd_buffer, "mem") == 0) {
         cmd_mem();
+    } else if (strcmp(cmd_buffer, "date") == 0) {
+        cmd_date();
+    } else if (strcmp(cmd_buffer, "uptime") == 0) {
+        cmd_uptime();
+    } else if (strncmp(cmd_buffer, "echo ", 5) == 0) {
+        cmd_echo(cmd_buffer + 5);
+    } else if (strcmp(cmd_buffer, "echo") == 0) {
+        g_terminal.write("\n");  // Just echo newline
+    } else if (strcmp(cmd_buffer, "version") == 0) {
+        cmd_version();
+    } else if (strcmp(cmd_buffer, "uname") == 0) {
+        cmd_uname();
+    } else if (strcmp(cmd_buffer, "cpuinfo") == 0) {
+        cmd_cpuinfo();
+    } else if (strcmp(cmd_buffer, "lspci") == 0) {
+        cmd_lspci();
     } else if (strcmp(cmd_buffer, "clear") == 0) {
         g_terminal.clear();
         g_terminal.write("uniOS Shell (uniSH)\n\n");
@@ -191,24 +463,41 @@ void shell_process_char(char c) {
         execute_command();
     } else if (c == '\b') {
         if (cursor_pos > 0) {
-            // Remove char from buffer
+            // Remove char at cursor position
             for (int i = cursor_pos - 1; i < cmd_len - 1; i++) {
                 cmd_buffer[i] = cmd_buffer[i + 1];
             }
             cmd_len--;
             cursor_pos--;
-            
-            // Update screen: backspace, then print remainder, then space, then back up
-            // This is tricky with just a dumb terminal.
-            // Easiest is to reprint the line.
-            // But Terminal doesn't support "move cursor back N chars" easily yet except via direct set_pos.
-            // Let's just use backspace on terminal which clears the char.
-            // But we need to handle insertion/deletion in middle.
-            
-            // Simple approach: Backspace visual only works for end of line deletion in dumb terminal
-            // For proper editing, we need to redraw the line.
-            // Let's implement simple end-of-line backspace for now.
             g_terminal.put_char('\b');
+        }
+    } else if (c == KEY_UP_ARROW) {
+        // Navigate history up
+        if (history_count > 0) {
+            int max_idx = (history_count < HISTORY_SIZE) ? history_count : HISTORY_SIZE;
+            if (history_index < max_idx - 1) {
+                history_index++;
+                clear_line();
+                int idx = (history_count - 1 - history_index) % HISTORY_SIZE;
+                if (idx < 0) idx += HISTORY_SIZE;
+                strcpy(cmd_buffer, history[idx]);
+                cmd_len = strlen(cmd_buffer);
+                display_line();
+            }
+        }
+    } else if (c == KEY_DOWN_ARROW) {
+        // Navigate history down
+        if (history_index > 0) {
+            history_index--;
+            clear_line();
+            int idx = (history_count - 1 - history_index) % HISTORY_SIZE;
+            if (idx < 0) idx += HISTORY_SIZE;
+            strcpy(cmd_buffer, history[idx]);
+            cmd_len = strlen(cmd_buffer);
+            display_line();
+        } else if (history_index == 0) {
+            history_index = -1;
+            clear_line();
         }
     } else if (c >= 32 && cmd_len < 255) {
         cmd_buffer[cmd_len++] = c;
