@@ -141,38 +141,125 @@ static void restore_cursor_area() {
 }
 
 void gui_start() {
-    ps2_mouse_init();
-    gfx_init(g_framebuffer);
-    gfx_clear(COLOR_DESKTOP);
-    gfx_fill_rect(0, g_framebuffer->height - 30, g_framebuffer->width, 30, COLOR_DARK_GRAY);
-    gfx_draw_string(10, g_framebuffer->height - 22, "uniOS Desktop - Press Q to exit", COLOR_WHITE);
+    // Note: gfx and mouse are already initialized during boot
+    // No need to reinitialize - would cause memory leaks and issues
+    
+    uint32_t screen_width = g_framebuffer->width;
+    uint32_t screen_height = g_framebuffer->height;
+    uint32_t taskbar_height = 40;
+    
+    // Draw gradient desktop background
+    gfx_draw_gradient_v(0, 0, screen_width, screen_height - taskbar_height, 
+                        COLOR_DESKTOP_TOP, COLOR_DESKTOP_BOTTOM);
+    
+    // Draw taskbar
+    gfx_fill_rect(0, screen_height - taskbar_height, screen_width, taskbar_height, COLOR_TASKBAR);
+    gfx_fill_rect(0, screen_height - taskbar_height, screen_width, 1, 0x333350);  // Top border
+    
+    // Draw start button
+    gfx_fill_rect(8, screen_height - taskbar_height + 8, 80, 24, COLOR_ACCENT);
+    gfx_draw_string(20, screen_height - taskbar_height + 14, "uniOS", COLOR_WHITE);
+    
+    // Draw desktop icons
+    int icon_y = 30;
+    int icon_spacing = 80;
+    
+    // Terminal icon
+    gfx_fill_rect(30, icon_y, 48, 48, 0x2a2a4a);
+    gfx_draw_rect(30, icon_y, 48, 48, COLOR_ACCENT);
+    gfx_draw_string(36, icon_y + 18, ">_", COLOR_WHITE);
+    gfx_draw_string(30, icon_y + 54, "Shell", COLOR_WHITE);
+    
+    // Info icon
+    gfx_fill_rect(30, icon_y + icon_spacing, 48, 48, 0x2a2a4a);
+    gfx_draw_rect(30, icon_y + icon_spacing, 48, 48, COLOR_SUCCESS);
+    gfx_draw_string(48, icon_y + icon_spacing + 18, "i", COLOR_SUCCESS);
+    gfx_draw_string(30, icon_y + icon_spacing + 54, "About", COLOR_WHITE);
     
     bool running = true;
     backup_x = -1;
+    uint64_t last_update = 0;
     
     while (running) {
         input_poll();
+        uint64_t now = timer_get_ticks();
+        bool status_updated = false;
         
-        // Get mouse state using unified API
+        // Update status bar every 100 ticks (~1 second)
+        if (now - last_update > 100) {
+            last_update = now;
+            status_updated = true;
+            
+            // Clear status area
+            gfx_fill_rect(screen_width - 250, screen_height - taskbar_height + 8, 240, 24, COLOR_TASKBAR);
+            
+            // Display time
+            RTCTime time;
+            rtc_get_time(&time);
+            char time_str[32];
+            int ti = 0;
+            time_str[ti++] = '0' + (time.hour / 10);
+            time_str[ti++] = '0' + (time.hour % 10);
+            time_str[ti++] = ':';
+            time_str[ti++] = '0' + (time.minute / 10);
+            time_str[ti++] = '0' + (time.minute % 10);
+            time_str[ti++] = ':';
+            time_str[ti++] = '0' + (time.second / 10);
+            time_str[ti++] = '0' + (time.second % 10);
+            time_str[ti] = 0;
+            gfx_draw_string(screen_width - 80, screen_height - taskbar_height + 14, time_str, COLOR_WHITE);
+            
+            // Display memory
+            extern uint64_t pmm_get_free_memory();
+            uint64_t free_mb = pmm_get_free_memory() / (1024 * 1024);
+            char mem_str[32] = "RAM: ";
+            int mi = 5;
+            if (free_mb >= 1000) mem_str[mi++] = '0' + (free_mb / 1000) % 10;
+            if (free_mb >= 100) mem_str[mi++] = '0' + (free_mb / 100) % 10;
+            if (free_mb >= 10) mem_str[mi++] = '0' + (free_mb / 10) % 10;
+            mem_str[mi++] = '0' + (free_mb % 10);
+            mem_str[mi++] = 'M';
+            mem_str[mi++] = 'B';
+            mem_str[mi] = 0;
+            gfx_draw_string(screen_width - 180, screen_height - taskbar_height + 14, mem_str, COLOR_GRAY);
+        }
+        
+        // Mouse handling - using unified input layer (supports both PS/2 and USB)
         InputMouseState mouse_state;
         input_mouse_get_state(&mouse_state);
         int32_t mx = mouse_state.x;
         int32_t my = mouse_state.y;
         
-        if (mx != backup_x || my != backup_y) {
-            restore_cursor_area();
+        // Status bar region: x from (screen_width - 250) to screen_width
+        bool cursor_in_status = (mx >= (int32_t)(screen_width - 260) && 
+                                 my >= (int32_t)(screen_height - taskbar_height));
+        
+        if (mx != backup_x || my != backup_y || status_updated) {
+            // If status was updated and cursor was/is in that region, don't restore
+            // (the backup data is stale from before the status update)
+            if (status_updated && cursor_in_status) {
+                // Skip restore - status bar content changed, backup is invalid
+            } else {
+                restore_cursor_area();
+            }
+            
             save_cursor_area(mx, my);
             gfx_draw_cursor(mx, my);
+            backup_x = mx;
+            backup_y = my;
         }
+        
+        // Keyboard input
         char c = 0;
         if (input_keyboard_has_char()) {
             c = input_keyboard_get_char();
         }
         if (c == 'q' || c == 'Q' || c == 27) running = false;
-        for (volatile int i = 0; i < 1000; i++);  // Reduced delay for USB
+        
+        for (volatile int i = 0; i < 1000; i++);  // Small delay for CPU
     }
     
-    // Restore shell screen - use black background
+    // Restore shell screen
     gfx_clear(COLOR_BLACK);
     gfx_draw_string(50, 50, "uniOS Shell (uniSH)", COLOR_WHITE);
 }
@@ -194,7 +281,7 @@ extern "C" void _start(void) {
     
     // Initialize serial console for debug output
     serial_init();
-    serial_puts("\r\n=== uniOS Kernel v0.2.2 ===\r\n");
+    serial_puts("\r\n=== uniOS Kernel v0.2.3 ===\r\n");
     
     // Get bootloader info if available
     if (bootloader_info_request.response) {
@@ -203,7 +290,7 @@ extern "C" void _start(void) {
         serial_printf("Bootloader: %s %s\r\n", g_bootloader_name, g_bootloader_version);
     }
     
-    DEBUG_INFO("uniOS Kernel v0.2.2 Starting...");
+    DEBUG_INFO("uniOS Kernel v0.2.3 Starting...");
     DEBUG_INFO("Framebuffer: %dx%d bpp=%d", fb->width, fb->height, fb->bpp);
 
     // Initialize core systems

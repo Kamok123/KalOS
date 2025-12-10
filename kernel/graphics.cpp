@@ -7,8 +7,12 @@
 static struct limine_framebuffer* framebuffer = nullptr;
 static uint32_t* backbuffer = nullptr;
 static uint64_t buffer_size = 0;
+static bool gfx_initialized = false;
 
 void gfx_init(struct limine_framebuffer* fb) {
+    // Prevent repeated initialization and memory leaks
+    if (gfx_initialized && framebuffer == fb) return;
+    
     framebuffer = fb;
     if (fb) {
         // Allocate backbuffer
@@ -80,6 +84,7 @@ void gfx_init(struct limine_framebuffer* fb) {
         // The main issue is scrolling.
         
         backbuffer = (uint32_t*)framebuffer->address; // Temporary: backbuffer IS framebuffer
+        gfx_initialized = true;
     }
 }
 
@@ -137,6 +142,29 @@ void gfx_draw_rect(int32_t x, int32_t y, int32_t w, int32_t h, uint32_t color) {
     gfx_fill_rect(x, y + h - 1, w, 1, color);     // Bottom
     gfx_fill_rect(x, y, 1, h, color);             // Left
     gfx_fill_rect(x + w - 1, y, 1, h, color);     // Right
+}
+
+void gfx_draw_gradient_v(int32_t x, int32_t y, int32_t w, int32_t h, uint32_t top_color, uint32_t bottom_color) {
+    if (!framebuffer || h <= 0 || w <= 0) return;
+    
+    // Extract RGB components
+    uint8_t tr = (top_color >> 16) & 0xFF;
+    uint8_t tg = (top_color >> 8) & 0xFF;
+    uint8_t tb = top_color & 0xFF;
+    
+    uint8_t br = (bottom_color >> 16) & 0xFF;
+    uint8_t bg = (bottom_color >> 8) & 0xFF;
+    uint8_t bb = bottom_color & 0xFF;
+    
+    for (int32_t row = 0; row < h; row++) {
+        // Linear interpolation
+        uint8_t r = tr + ((br - tr) * row) / h;
+        uint8_t g = tg + ((bg - tg) * row) / h;
+        uint8_t b = tb + ((bb - tb) * row) / h;
+        uint32_t color = (r << 16) | (g << 8) | b;
+        
+        gfx_fill_rect(x, y + row, w, 1, color);
+    }
 }
 
 // Simple arrow cursor (12x19)

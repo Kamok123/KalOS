@@ -31,6 +31,10 @@ static int8_t mouse_scroll = 0;  // Scroll wheel delta accumulator
 static int32_t screen_width = 1024;
 static int32_t screen_height = 768;
 
+// Polling interval tracking - per USB spec, must wait for interval before polling again
+static uint64_t last_keyboard_poll = 0;
+static uint64_t last_mouse_poll = 0;
+
 // Debug flag - controls verbose logging
 static bool hid_debug = false;
 
@@ -287,18 +291,19 @@ void usb_hid_init() {
             uint8_t mouse_ep = (dev->hid_endpoint2 != 0) ? dev->hid_endpoint2 : dev->hid_endpoint;
             uint8_t mouse_iface = (dev->hid_interface2 != 0) ? dev->hid_interface2 : dev->hid_interface;
             
-            DEBUG_LOG("Mouse detected: Slot %d EP %d Iface %d", dev->slot_id, mouse_ep, mouse_iface);
+            DEBUG_LOG("Mouse detected: Slot %d EP %d Iface %d Boot=%d", 
+                dev->slot_id, mouse_ep, mouse_iface, dev->is_boot_interface ? 1 : 0);
             
-            // Boot protocol for standalone mice (and composite mice on secondary interface)
-            if (dev->is_boot_interface && dev->hid_endpoint != 0) {
-                // For composite devices, need to set protocol on the correct interface
+            // Set boot protocol for boot-capable mice
+            // This MUST be done to get the standardized 3-byte report format
+            if (dev->is_boot_interface && mouse_ep != 0) {
                 uint16_t transferred;
                 bool proto_ok = xhci_control_transfer(
                     dev->slot_id,
                     0x21,  // Host-to-device, Class, Interface
                     HID_REQ_SET_PROTOCOL,
-                    HID_PROTOCOL_BOOT,
-                    mouse_iface,  // Use the correct interface for mouse
+                    HID_PROTOCOL_BOOT,  // Boot protocol = 0
+                    mouse_iface,  // Interface number for mouse
                     0,
                     nullptr,
                     &transferred
@@ -306,16 +311,16 @@ void usb_hid_init() {
                 if (proto_ok) {
                     DEBUG_LOG("Mouse Boot Protocol set OK");
                 } else {
-                    DEBUG_ERROR("Mouse Boot Protocol FAIL");
+                    DEBUG_WARN("Mouse Boot Protocol FAIL (may still work)");
                 }
             }
             
+            // Set idle rate for mouse - report only on change
             if (mouse_ep != 0) {
-                // Set idle for mouse too
                 uint16_t transferred;
                 xhci_control_transfer(
                     dev->slot_id,
-                    0x21,
+                    0x21,  // Host-to-device, Class, Interface
                     HID_REQ_SET_IDLE,
                     0,  // idle_rate = 0 (report only on change)
                     mouse_iface,
@@ -325,6 +330,7 @@ void usb_hid_init() {
                 );
             }
             
+            // Center mouse on screen
             mouse_x = screen_width / 2;
             mouse_y = screen_height / 2;
         }
@@ -338,49 +344,61 @@ void usb_hid_init() {
 
 void usb_hid_poll() {
     int count = usb_get_device_count();
+    uint64_t now = timer_get_ticks();
     
     for (int i = 0; i < count; i++) {
         UsbDeviceInfo* dev = usb_get_device(i);
         if (!dev || !dev->configured) continue;
         
-        // Poll keyboard (primary endpoint)
+        // Poll keyboard (primary endpoint) - with interval checking
         if (dev->is_keyboard && dev->hid_endpoint != 0) {
-            HidKeyboardReport report;
-            uint16_t transferred;
+            // Convert bInterval to ticks (timer runs at 100Hz, interval is in ms)
+            // bInterval for USB 1.x/2.0 in low/full speed = 1-255ms
+            // For high speed, it's 2^(interval-1) * 125us frames
+            uint64_t keyboard_interval = dev->hid_interval;
+            if (keyboard_interval < 1) keyboard_interval = 10;  // Default 10ms
+            // Convert ms to ticks (100Hz = 10ms per tick)
+            uint64_t keyboard_ticks = (keyboard_interval + 9) / 10;
+            if (keyboard_ticks < 1) keyboard_ticks = 1;
             
-            if (xhci_interrupt_transfer(dev->slot_id, dev->hid_endpoint, 
-                                        &report, sizeof(report), &transferred)) {
-                if (transferred >= 3) {  // Minimum valid keyboard report
-                    process_keyboard_report(&report);
+            if (now - last_keyboard_poll >= keyboard_ticks) {
+                HidKeyboardReport report;
+                uint16_t transferred;
+                
+                if (xhci_interrupt_transfer(dev->slot_id, dev->hid_endpoint, 
+                                            &report, sizeof(report), &transferred)) {
+                    if (transferred >= 3) {
+                        process_keyboard_report(&report);
+                    }
+                    last_keyboard_poll = now;
                 }
             }
         }
         
-        // Poll mouse
-        // For composite devices with keyboard+mouse, use secondary endpoint
-        // For standalone mouse, use primary endpoint
+        // Poll mouse - with interval checking
         if (dev->is_mouse) {
-            HidMouseReport report;
-            uint16_t transferred;
-            
             uint8_t mouse_ep = (dev->hid_endpoint2 != 0) ? dev->hid_endpoint2 : dev->hid_endpoint;
+            uint8_t mouse_interval = (dev->hid_endpoint2 != 0) ? dev->hid_interval2 : dev->hid_interval;
             
-            if (mouse_ep != 0) {
-                // Debug: Check if transfer is pending
-                // bool pending = xhci_is_transfer_pending(dev->slot_id, mouse_ep);
+            if (mouse_interval < 1) mouse_interval = 10;  // Default 10ms
+            uint64_t mouse_ticks = (mouse_interval + 9) / 10;
+            if (mouse_ticks < 1) mouse_ticks = 1;
+            
+            if (mouse_ep != 0 && (now - last_mouse_poll >= mouse_ticks)) {
+                HidMouseReport report;
+                uint16_t transferred;
                 
                 if (xhci_interrupt_transfer(dev->slot_id, mouse_ep,
                                             &report, sizeof(report), &transferred)) {
-                    
                     if (hid_debug) {
-                        DEBUG_LOG("Mouse data: Slot %d EP %d Len %d Buttons %x X %d Y %d", 
-                            dev->slot_id, mouse_ep, transferred, 
-                            report.buttons, report.x, report.y);
+                        DEBUG_LOG("Mouse: EP%d Len%d B%x X%d Y%d", 
+                            mouse_ep, transferred, report.buttons, report.x, report.y);
                     }
                     
-                    if (transferred >= 3) {  // Minimum valid mouse report
+                    if (transferred >= 3) {
                         process_mouse_report(&report, transferred);
                     }
+                    last_mouse_poll = now;
                 }
             }
         }

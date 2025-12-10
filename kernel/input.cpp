@@ -94,32 +94,32 @@ bool input_mouse_available() {
 void input_mouse_get_state(InputMouseState* state) {
     if (!state) return;
     
-    // Clear scroll delta (we accumulate it fresh each time)
+    // Clear scroll delta
     state->scroll_delta = 0;
     
-    // Prefer USB mouse if available
+    // Get PS/2 mouse state first (more reliable in QEMU)
+    const MouseState* ps2_mouse = ps2_mouse_get_state();
+    state->x = ps2_mouse->x;
+    state->y = ps2_mouse->y;
+    state->left = ps2_mouse->left_button;
+    state->right = ps2_mouse->right_button;
+    state->middle = ps2_mouse->middle_button;
+    
+    // If USB mouse is available AND has data, use it instead
     if (usb_hid_mouse_available()) {
-        int32_t x, y;
+        int32_t usb_x, usb_y;
         bool left, right, middle;
-        usb_hid_mouse_get_state(&x, &y, &left, &right, &middle);
+        usb_hid_mouse_get_state(&usb_x, &usb_y, &left, &right, &middle);
         
-        state->x = x;
-        state->y = y;
-        state->left = left;
-        state->right = right;
-        state->middle = middle;
-        
-        // Get scroll delta from USB HID layer (added in usb_hid improvements)
-        state->scroll_delta = usb_hid_mouse_get_scroll();
-    } else {
-        // Fall back to PS/2 mouse
-        const MouseState* ps2_mouse = ps2_mouse_get_state();
-        state->x = ps2_mouse->x;
-        state->y = ps2_mouse->y;
-        state->left = ps2_mouse->left_button;
-        state->right = ps2_mouse->right_button;
-        state->middle = ps2_mouse->middle_button;
-        state->scroll_delta = 0; // PS/2 basic mouse has no scroll in current impl
+        // Use USB mouse if it has moved from origin
+        if (usb_x != 0 || usb_y != 0) {
+            state->x = usb_x;
+            state->y = usb_y;
+            state->left = left;
+            state->right = right;
+            state->middle = middle;
+            state->scroll_delta = usb_hid_mouse_get_scroll();
+        }
     }
 }
 
