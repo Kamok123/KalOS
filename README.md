@@ -14,7 +14,7 @@ Current Version: **v0.1**
 
 ---
 
-## ✨ Features
+## Features
 
 *   **Modern Core**: Custom C++20 kernel with minimal assembly stubs.
 *   **Boot Protocol**: Powered by **Limine** (v8.x) for a seamless, quiet boot experience.
@@ -22,14 +22,14 @@ Current Version: **v0.1**
 *   **Visuals**: Direct framebuffer access with custom font rendering and a sleek dark theme.
 *   **Architecture**: Full GDT, IDT, and interrupt handling setup.
 
-## ⚠️ Known Issues (Real Hardware)
+## Known Issues (Real Hardware)
 
 While uniOS runs perfectly in emulators, real hardware can be unpredictable:
 *   **USB Mouse**: May not function on some controllers due to interrupt transfer quirks. *Fallback: PS/2 mouse support is active.*
 *   **ACPI Poweroff**: Shutdown may hang on systems requiring strict ACPI AML parsing. *Fallback: Manual power off may be required.*
 *   **Scroll Performance**: Scrolling may be slower on high-resolution displays (4K+) due to unoptimized framebuffer movement.
 
-## 🚀 Getting Started
+## Getting Started
 
 ### Prerequisites
 *   `gcc` (cross-compiler for `x86_64-elf`)
@@ -41,7 +41,7 @@ While uniOS runs perfectly in emulators, real hardware can be unpredictable:
 
 ```bash
 # Clone the repository
-git clone https://github.com/92qryg6psz-byte/uniOS.git
+git clone https://github.com/unionyxx/uniOS.git
 cd uniOS
 
 # Build Limine (one-time setup)
@@ -52,7 +52,7 @@ make -C limine
 make run
 ```
 
-## 📂 Structure
+## Structure
 
 | Directory | Description |
 |-----------|-------------|
@@ -61,9 +61,6 @@ make run
 | `libc/` | Custom C standard library implementation. |
 | `userspace/` | User-mode applications and shells. |
 
-## 📄 License
+## License
 
 This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
-
----
-*Crafted with ❤️ by skyyii*
