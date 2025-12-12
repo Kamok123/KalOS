@@ -1259,7 +1259,10 @@ void shell_process_char(char c) {
             }
             clipboard[clipboard_len] = 0;
             selection_start = -1;  // Clear selection
-            // Don't cancel line - just copied
+            // Redraw to remove highlighting
+            int col, row;
+            g_terminal.get_cursor_pos(&col, &row);
+            redraw_line_at(row, cursor_pos);
         } else {
             // No selection - cancel line
             g_terminal.write("^C\n");
