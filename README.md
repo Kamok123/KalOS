@@ -10,7 +10,7 @@
 
 **uniOS** is a hobby operating system built from scratch in C++20. It features a working shell with command piping, TCP/IP networking, USB support, and runs on real x86-64 hardware.
 
-Current Version: **v0.4.5**
+Current Version: **v0.5.0**
 
 ---
 
@@ -117,12 +117,19 @@ make debug && make run
 | **Network** | `ifconfig` | Show network configuration |
 | | `dhcp` | Request IP via DHCP |
 | | `ping <host>` | Ping an IP or hostname |
+| **Scripting** | `run <file>` | Execute script file |
+| | `set NAME=value` | Set variable (or list all) |
+| | `unset NAME` | Remove variable |
+| | `if/else/endif` | Conditional blocks |
+| | `while/end` | Loop blocks |
 | **Other** | `clear` | Clear screen |
 | | `gui` | Start GUI mode |
 | | `reboot` | Reboot system |
 | | `poweroff` | Shutdown (ACPI) |
 
 > **Tip:** Commands can be piped: `ls | grep elf | wc`
+> 
+> **Scripting:** Use `\n` for newlines: `write test.sh "set X=1\necho $X"`
 
 ## Keyboard Shortcuts
 
