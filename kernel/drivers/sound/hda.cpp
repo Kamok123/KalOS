@@ -61,7 +61,7 @@ void hda_init() {
                pci_dev.function);
 
     // Enable memory space and bus mastering for sound card device.
-    pci_enable_io_space(&pci_dev);
+    pci_enable_memory_space(&pci_dev);
     pci_enable_bus_mastering(&pci_dev);
 
     DEBUG_INFO("enabled memory space and bus mastering for hd audio device");
