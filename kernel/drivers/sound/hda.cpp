@@ -299,6 +299,7 @@ void hda_init() {
     node_count = hda_send_command(hda_info.codec, hda_info.afg.node, HDA_VERB_GET_PARAMETER, HDA_NODE_PARAMETER_NODE_COUNT);
 
     // Iterate all AFG nodes and find useful widgets and pins.
+    // TO-DO: revisit this part later. Add audio mixers and proper parent nodes.
     first_node = (node_count >> 16) & 0xFF;
     last_node = first_node + (node_count & 0xFF);
     for (uint32_t node = first_node; node < last_node; node++) {
@@ -347,6 +348,8 @@ void hda_init() {
     DEBUG_INFO("init completed");
 }
 
+// Credits: BleskOS HDA driver.
+// TO-DO: Refactor. Revisit this part later.
 uint16_t hda_get_node_connection_entry(HdAudioNode* node, uint32_t connection_entry_number) {
     // Read connection list length.
     uint32_t list_length = hda_send_command(hda_info.codec, node->node, HDA_VERB_GET_PARAMETER, HDA_NODE_PARAMETER_CONNECTION_LIST_LENGTH);
@@ -509,6 +512,8 @@ uint32_t hda_send_command(uint32_t codec, uint32_t node, uint32_t verb, uint32_t
 }
 
 // Set node volume.
+// Credits: BleskOS HDA driver.
+// TO-DO: Use parent node amplifier capabilities instead of AFG ones if node does not have its own.
 void hda_set_node_volume(HdAudioNode* node, uint32_t volume) {
     uint32_t payload = 0x3000;
     payload |= 0x8000;
@@ -575,6 +580,7 @@ void hda_set_sample_rate(uint32_t sample_rate) {
 
 // Construct 16-bit sound format from sample rate, channel count and bits per sample.
 // Used for setting stream format.
+// Credits; BleskOS HDA driver.
 uint16_t hda_return_sound_data_format(uint32_t sample_rate, uint32_t channels, uint32_t bits_per_sample) {
     uint16_t data_format = (channels - 1);
 
@@ -604,15 +610,6 @@ uint16_t hda_return_sound_data_format(uint32_t sample_rate, uint32_t channels, u
     }
     else if (sample_rate==22050) {
         data_format |= (0b1000001 << 8);
-    }
-    else if (sample_rate==16000) {
-        data_format |= (0b0000010 << 8);
-    }
-    else if (sample_rate==11025) {
-        data_format |= (0b1000011 << 8);
-    }
-    else if (sample_rate==8000) {
-        data_format |= (0b0000101 << 8);
     }
     else if (sample_rate==88200) {
         data_format |= (0b1001000 << 8);
