@@ -175,12 +175,21 @@ uint8_t ac97_get_volume() {
     return ac97_info.sound_volume;
 }
 
+// Set channel count for output sound data.
+void ac97_set_channels(uint8_t channels) {
+    ac97_info.channels = channels;
+
+    // TO-DO: actually change channel count.
+}
+
 // Set sample rate. Most common ones are 44100 and 48000 Hz.
 void ac97_set_sample_rate(uint16_t sample_rate) {
     if (!ac97_info.is_initialized) {
         DEBUG_ERROR("ac97 device is not initialized");
         return;
     }
+
+    ac97_info.sample_rate = sample_rate;
 
     // Set sample rate if supported by device.
     if (ac97_info.capabilities & AC97_EXTENDED_CAPABILITY_VARIABLE_SAMPLE_RATE) {

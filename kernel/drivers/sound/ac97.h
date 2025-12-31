@@ -64,6 +64,10 @@ struct Ac97Device {
 
     uint8_t sound_volume; // Current sound volume.
 
+    // Stream parameters.
+    uint8_t channels; // Sound buffer channels.
+    uint32_t sample_rate; // Sound buffer sample rate.
+
     // Sound card data.
     uint64_t nam; // Native Audio Mixer base address.
     uint64_t nabm; // Native Audio Bus Master base address.
@@ -97,6 +101,7 @@ void ac97_reset();
 void ac97_set_volume(uint8_t volume);
 uint8_t ac97_get_volume();
 
+void ac97_set_channels(uint8_t channels);
 void ac97_set_sample_rate(uint16_t sample_rate);
 
 void ac97_play(uint8_t* data, uint32_t size);

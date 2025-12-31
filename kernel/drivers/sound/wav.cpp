@@ -52,9 +52,9 @@ bool wav_open(const char* filename, uint8_t** data, uint32_t* data_size, uint32_
         return false;
     }
 
-    // Only 16-bit stereo supported
-    if (fmt_chunk->channels != 2 || fmt_chunk->bits_per_sample != 16) {
-        DEBUG_ERROR("%s: only 16-bit stereo data is supported", filename);
+    // Only 16-bit is supported
+    if (fmt_chunk->bits_per_sample != 16) {
+        DEBUG_ERROR("%s: only 16-bit data is supported", filename);
         return false;
     }
 

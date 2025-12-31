@@ -97,12 +97,7 @@ void sound_set_channels(uint8_t channels) {
         return;
     }
 
-    if (used_sound_card == SOUND_HD_AUDIO) {
-        hda_set_channels(channels);
-        return;
-    }
-
-    DEBUG_WARN("set_channels is not available on ac97");
+    return used_sound_card == SOUND_HD_AUDIO ? hda_set_channels(channels) : ac97_set_channels(channels);
 }
 
 void sound_set_bits_per_sample(uint8_t bits_per_sample) {
@@ -112,11 +107,10 @@ void sound_set_bits_per_sample(uint8_t bits_per_sample) {
     }
 
     if (used_sound_card == SOUND_HD_AUDIO) {
-        hda_set_bits_per_sample(bits_per_sample);
-        return;
+        return hda_set_bits_per_sample(bits_per_sample);
     }
 
-    DEBUG_WARN("set_bits_per_sample is not available on ac97");
+    DEBUG_WARN("not available on ac97");
 }
 
 void sound_set_sample_rate(uint32_t sample_rate) {
