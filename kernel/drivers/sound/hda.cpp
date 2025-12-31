@@ -268,7 +268,7 @@ void hda_init() {
             DEBUG_INFO("found afg at %d", node);
 
             // Set AFG node and break from cycle.
-            hda_info.afg = HdAudioNode(node, HDA_WIDGET_AFG, HDA_INVALID, HDA_INVALID);
+            hda_info.afg.init(node, HDA_WIDGET_AFG, HDA_INVALID, HDA_INVALID);
             break;
         }
     }
@@ -418,8 +418,6 @@ void hda_init_pin(HdAudioNode* node) {
 
     for (uint32_t i = 0; i < 1000; i++)
         io_wait();
-
-    hda_send_command(hda_info.codec, node->node, 0x701, 0x00);
 
     // Mute pin by default. We will set volume only for needed ones.
     hda_set_node_volume(node, 0);
