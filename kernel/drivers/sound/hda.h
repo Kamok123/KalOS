@@ -113,29 +113,39 @@
 #define HDA_NODE_PARAMETER_OUTPUT_AMPLIFIER_CAPABILITIES 0x12
 
 // Widgets.
-#define HDA_WIDGET_AUDIO_OUTPUT 0x0
-#define HDA_WIDGET_PIN_COMPLEX 0x4
+#define HDA_WIDGET_AUDIO_OUTPUT 0
+#define HDA_WIDGET_AUDIO_MIXER 2
+#define HDA_WIDGET_PIN_COMPLEX 4
+
+#define HDA_WIDGET_AFG 0xAF6
 
 // Pins.
-#define HDA_PIN_LINE_OUT 0x0
-#define HDA_PIN_HEADPHONE_OUT 0x2
+#define HDA_PIN_LINE_OUT 0
+#define HDA_PIN_HEADPHONE_OUT 2
 
 // Miscs.
-#define HDA_MAX_OUTPUT_WIDGETS 24
-#define HDA_MAX_PINS_PER_TYPE 4
+#define HDA_MAX_AFG_NODES 48
 
 #define HDA_INVALID 0xFFFFFFFF
 
 struct HdAudioNode {
-    uint16_t node;
+    uint32_t node;
     uint32_t node_type;
 
-    uint16_t parent_node;
+    uint32_t parent_node;
     uint32_t parent_node_type;
 
     uint32_t supported_rates;
     uint32_t supported_formats;
     uint32_t output_amplifier_capabilities;
+
+    inline void init(uint32_t node, uint32_t node_type, uint32_t parent_node, uint32_t parent_node_type) {
+        this->node = node;
+        this->node_type = node_type;
+
+        this->parent_node = parent_node;
+        this->parent_node_type = parent_node_type;
+    }
 };
 
 struct HdAudioBufferEntry {
@@ -167,17 +177,12 @@ struct HdAudioDevice {
 
     uint32_t codec; // CODEC ID.
 
-    HdAudioNode afg; // Audio Function Group node.
+    // Audio Function Group node.
+    HdAudioNode afg;
 
-    // Output stuff.
-    HdAudioNode output_widgets[HDA_MAX_OUTPUT_WIDGETS]; // Output widget array.
-    uint32_t output_widget_count; // Count of audio outputs.
-
-    HdAudioNode line_out_pins[HDA_MAX_PINS_PER_TYPE]; // Array of line out pins.
-    uint32_t line_out_pin_count; // Count of line out pins.
-
-    HdAudioNode headphone_out_pins[HDA_MAX_PINS_PER_TYPE]; // Array of headphone pins.
-    uint32_t headphone_out_pin_count; // Count of headphone out pins.
+    // AFG nodes.
+    HdAudioNode nodes[HDA_MAX_AFG_NODES];
+    uint32_t node_count;
 
     // Memory stuff.
     DMAAllocation buffer_entries_dma; // DMA allocation for buffer entries.
@@ -211,14 +216,7 @@ bool hda_is_paused();
 bool hda_is_playing();
 
 void hda_init();
-void hda_init_pin(HdAudioNode* node, uint32_t node_id, uint32_t node_type); // Not meant for external use!
-void hda_init_output(HdAudioNode* node, uint32_t node_id, uint32_t node_type); // Not meant for external use!
-
 void hda_reset();
-
-uint32_t hda_send_command(uint32_t codec, uint32_t node, uint32_t verb, uint32_t command); // Not meant for external use!
-
-void hda_set_node_volume(HdAudioNode* node, uint32_t volume);
 
 void hda_set_volume(uint8_t volume);
 uint8_t hda_get_volume();
@@ -236,3 +234,14 @@ void hda_poll();
 
 uint32_t hda_get_played_bytes();
 uint32_t hda_get_stream_position();
+
+// Internal usage only.
+uint16_t hda_get_node_connection_entry(HdAudioNode* node, uint32_t connection_entry_number);
+void hda_power_on_node(HdAudioNode* node);
+
+void hda_init_pin(HdAudioNode* node);
+void hda_init_mixer(HdAudioNode* node);
+void hda_init_output(HdAudioNode* node);
+
+uint32_t hda_send_command(uint32_t codec, uint32_t node, uint32_t verb, uint32_t command);
+void hda_set_node_volume(HdAudioNode* node, uint32_t volume);

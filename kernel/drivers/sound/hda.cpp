@@ -12,6 +12,7 @@
 #include "mp3.h"
 
 #include "debug.h"
+#include "timer.h"
 #include "unifs.h"
 
 #include "io.h"
@@ -112,7 +113,7 @@ void hda_init() {
     mmio_write64((void*)(hda_info.base + HDA_DMA_POSITION_BASE_ADDRESS), 0);
 
     // Disable stream synchronization.
-    mmio_write64((void*)(hda_info.base + HDA_STREAM_SYNCHRONIZATION), 0);
+    mmio_write32((void*)(hda_info.base + HDA_STREAM_SYNCHRONIZATION), 0);
 
     // Get output stream address.
     // There are a lot of stream descriptors but we need only output stream. Input stream descriptors always go first.
@@ -267,7 +268,7 @@ void hda_init() {
             DEBUG_INFO("found afg at %d", node);
 
             // Set AFG node and break from cycle.
-            hda_info.afg.node = node;
+            hda_info.afg = HdAudioNode(node, HDA_WIDGET_AFG, HDA_INVALID, HDA_INVALID);
             break;
         }
     }
@@ -277,14 +278,14 @@ void hda_init() {
         return;
     }
 
-    // Set power state for AFG. 0 - full power. Is it really needed?
-    hda_send_command(hda_info.codec, hda_info.afg.node, HDA_VERB_SET_POWER_STATE, 0);
+    // Set power state for AFG.
+    hda_power_on_node(&hda_info.afg);
 
     // Reset all nodes inside codec AFG.
     hda_send_command(hda_info.codec, hda_info.afg.node, HDA_VERB_AFG_NODE_RESET, 0);
 
     // Wait for node reset.
-    for (uint32_t i = 0; i < 10; i++)
+    for (uint32_t i = 0; i < 100; i++)
         io_wait();
 
     // Collect AFG capabilities.
@@ -299,53 +300,68 @@ void hda_init() {
     node_count = hda_send_command(hda_info.codec, hda_info.afg.node, HDA_VERB_GET_PARAMETER, HDA_NODE_PARAMETER_NODE_COUNT);
 
     // Iterate all AFG nodes and find useful widgets and pins.
-    // TO-DO: revisit this part later. Add audio mixers and proper parent nodes.
     first_node = (node_count >> 16) & 0xFF;
     last_node = first_node + (node_count & 0xFF);
     for (uint32_t node = first_node; node < last_node; node++) {
+        // Get pointer to this node.
+        HdAudioNode* current_node = &hda_info.nodes[node];
+
         // Get audio widget capabilities and node widget type.
-        uint8_t node_widget_type = (hda_send_command(hda_info.codec, node, HDA_VERB_GET_PARAMETER, HDA_NODE_PARAMETER_AUDIO_WIDGET_CAPABILITIES) >> 20) & 0xF;
-        if (node_widget_type == HDA_WIDGET_AUDIO_OUTPUT) {
-            DEBUG_INFO("found audio output widget at %d", node);
+        uint8_t node_type = (hda_send_command(hda_info.codec, node, HDA_VERB_GET_PARAMETER, HDA_NODE_PARAMETER_AUDIO_WIDGET_CAPABILITIES) >> 20) & 0xF;
 
-            // Add this output to array and initialize it.
-            hda_init_output(&hda_info.output_widgets[hda_info.output_widget_count], node, node_widget_type);
+        // Get parent node and type of parent node of this pin.
+        uint32_t parent_node = hda_get_node_connection_entry(current_node, 0);
+        uint32_t parent_node_type = (hda_send_command(hda_info.codec, node, HDA_VERB_GET_PARAMETER, HDA_NODE_PARAMETER_AUDIO_WIDGET_CAPABILITIES) >> 20) & 0xF;
 
-            hda_info.output_widget_count++;
+        // Initialize current node.
+        current_node->init(node, node_type, parent_node, parent_node_type);
+
+        if (node_type == HDA_WIDGET_AUDIO_OUTPUT) {
+            DEBUG_INFO("found audio output widget at %d of %d", node, current_node->parent_node);
+
+            // Initialize this output.
+            hda_init_output(current_node);
         }
-        else if (node_widget_type == HDA_WIDGET_PIN_COMPLEX) {
+        else if (node_type == HDA_WIDGET_AUDIO_MIXER) {
+            DEBUG_INFO("found audio mixer widget at %d", node);
+
+            // Initialize this mixer.
+            hda_init_mixer(current_node);
+        }
+        else if (node_type == HDA_WIDGET_PIN_COMPLEX) {
             // This node is pin. Get type of this pin node with pin widget configuration command.
-            uint8_t node_pin_type = (hda_send_command(hda_info.codec, node, HDA_VERB_GET_PIN_WIDGET_CONFIGURATION, 0) >> 20) & 0xF;
-            if (node_pin_type == HDA_PIN_LINE_OUT) {
+            uint8_t pin_type = (hda_send_command(hda_info.codec, node, HDA_VERB_GET_PIN_WIDGET_CONFIGURATION, 0) >> 20) & 0xF;
+            if (pin_type == HDA_PIN_LINE_OUT) {
                 DEBUG_INFO("found line out pin widget at %d", node);
 
                 // Add this pin to array and initialize it.
-                hda_init_pin(&hda_info.line_out_pins[hda_info.line_out_pin_count], node, node_widget_type);
-
-                hda_info.line_out_pin_count++;
+                hda_init_pin(current_node);
             }
-            else if (node_pin_type == HDA_PIN_HEADPHONE_OUT) {
+            else if (pin_type == HDA_PIN_HEADPHONE_OUT) {
                 // Initialize headphone out pin. Collect needed capabilities.
                 DEBUG_INFO("found headphone out pin widget at %d", node);
 
                 // Add this pin to array and initialize it.
-                hda_init_pin(&hda_info.headphone_out_pins[hda_info.headphone_out_pin_count], node, node_widget_type);
-
-                hda_info.headphone_out_pin_count++;
+                hda_init_pin(current_node);
             }
             else {
-                // Disable not needed pins.
+                // Don't enable power for not needed pins.
             }
         }
+
+        hda_info.node_count++;
     }
 
     // Init complete.
     hda_info.is_initialized = true;
 
+    // Reset everything.
+    hda_reset();
+
     // Set default volume to 100%
     hda_set_volume(100);
 
-    DEBUG_INFO("init completed");
+    //DEBUG_INFO("init completed");
 }
 
 // Credits: BleskOS HDA driver.
@@ -367,23 +383,26 @@ uint16_t hda_get_node_connection_entry(HdAudioNode* node, uint32_t connection_en
     return ((hda_send_command(hda_info.codec, node->node, HDA_VERB_GET_CONNECTION_LIST_ENTRY, ((connection_entry_number/2)*2)) >> ((connection_entry_number%2)*16)) & 0xFFFF);
 }
 
-// Initialize pin widget.
-void hda_init_pin(HdAudioNode* node, uint32_t node_id, uint32_t node_type) {
-    node->node = node_id;
-    node->node_type = node_type;
+// Set power state for node.
+void hda_power_on_node(HdAudioNode* node) {
+    // Set power state for this pin. 0 - full power.
+    hda_send_command(hda_info.codec, node->node, HDA_VERB_SET_POWER_STATE, 0);
 
+    // Wait for powering on.
+    for (uint32_t i = 0; i < 1000; i++)
+        io_wait();
+}
+
+// Initialize pin widget.
+void hda_init_pin(HdAudioNode* node) {
     // Check if node widget type is pin complex.
     if (node->node_type != HDA_WIDGET_PIN_COMPLEX) {
         DEBUG_WARN("trying to initialize non pin widget");
         return;
     }
 
-    // Set power state for this pin. 0 - full power.
-    hda_send_command(hda_info.codec, node->node, HDA_VERB_SET_POWER_STATE, 0);
-
-    // Wait for powering on.
-    for (uint32_t i = 0; i < 10; i++)
-        io_wait();
+    // Set power state for this pin.
+    hda_power_on_node(node);
 
     // Enable pin.
     hda_send_command(hda_info.codec, node->node, HDA_VERB_SET_PIN_WIDGET_CONTROL, (hda_send_command(hda_info.codec, node->node, 0xF07, 0) | 0x80 | 0x40));
@@ -397,32 +416,49 @@ void hda_init_pin(HdAudioNode* node, uint32_t node_id, uint32_t node_type) {
     // Enable EAPD.
     hda_send_command(hda_info.codec, node->node, HDA_VERB_SET_EAPD, 0x6);
 
-    // Get parent node and type of parent node of this pin.
-    node->parent_node = hda_get_node_connection_entry(node, 0);
-    node->parent_node_type = (hda_send_command(hda_info.codec, node->node, HDA_VERB_GET_PARAMETER, HDA_NODE_PARAMETER_AUDIO_WIDGET_CAPABILITIES) >> 20) & 0xF;
+    for (uint32_t i = 0; i < 1000; i++)
+        io_wait();
+
+    hda_send_command(hda_info.codec, node->node, 0x701, 0x00);
+
+    // Mute pin by default. We will set volume only for needed ones.
+    hda_set_node_volume(node, 0);
+}
+
+// Initialize audio mixer widget.
+void hda_init_mixer(HdAudioNode* node) {
+    // Check if node widget type is mixer.
+    if (node->node_type != HDA_WIDGET_AUDIO_MIXER) {
+        DEBUG_WARN("trying to initialize non audio output widget");
+        return;
+    }
+
+    // Set power state for this widget.
+    hda_power_on_node(node);
+
+    // Collect node capabilities.
+    node->supported_rates = hda_send_command(hda_info.codec, node->node, HDA_VERB_GET_PARAMETER, HDA_NODE_PARAMETER_SUPPORTED_PCM_RATES);
+    node->supported_formats = hda_send_command(hda_info.codec, node->node, HDA_VERB_GET_PARAMETER, HDA_NODE_PARAMETER_SUPPORTED_FORMATS);
+
+    node->output_amplifier_capabilities = hda_send_command(hda_info.codec, node->node, HDA_VERB_GET_PARAMETER, HDA_NODE_PARAMETER_OUTPUT_AMPLIFIER_CAPABILITIES);
+
+    for (uint32_t i = 0; i < 1000; i++)
+        io_wait();
+
+    // Mute mixer by default. We will set volume only for needed ones.
+    hda_set_node_volume(node, 0);
 }
 
 // Initialize audio output widget.
-void hda_init_output(HdAudioNode* node, uint32_t node_id, uint32_t node_type) {
-    node->node = node_id;
-    node->node_type = node_type;
-
+void hda_init_output(HdAudioNode* node) {
     // Check if node widget type is output.
     if (node->node_type != HDA_WIDGET_AUDIO_OUTPUT) {
         DEBUG_WARN("trying to initialize non audio output widget");
         return;
     }
 
-    // Set parent node to AFG and type to invalid.
-    node->parent_node = hda_info.afg.node;
-    node->parent_node_type = HDA_INVALID;
-
-    // Set power state for this widget. 0 - full power.
-    hda_send_command(hda_info.codec, node->node, HDA_VERB_SET_POWER_STATE, 0);
-
-    // Wait for powering on.
-    for (uint32_t i = 0; i < 10; i++)
-        io_wait();
+    // Set power state for this widget.
+    hda_power_on_node(node);
 
     // Collect node capabilities.
     node->supported_rates = hda_send_command(hda_info.codec, node->node, HDA_VERB_GET_PARAMETER, HDA_NODE_PARAMETER_SUPPORTED_PCM_RATES);
@@ -433,7 +469,10 @@ void hda_init_output(HdAudioNode* node, uint32_t node_id, uint32_t node_type) {
     // Connect to output stream.
     hda_send_command(hda_info.codec, node->node, HDA_VERB_SET_CONVERTER_STREAM, 0x10);
 
-    for (uint32_t i = 0; i < 10; i++)
+    // Enable EAPD.
+    hda_send_command(hda_info.codec, node->node, HDA_VERB_SET_EAPD, 0x6);
+
+    for (uint32_t i = 0; i < 1000; i++)
         io_wait();
 
     // Mute audio output by default. We will set volume only for needed ones.
@@ -513,16 +552,24 @@ uint32_t hda_send_command(uint32_t codec, uint32_t node, uint32_t verb, uint32_t
 
 // Set node volume.
 // Credits: BleskOS HDA driver.
-// TO-DO: Use parent node amplifier capabilities instead of AFG ones if node does not have its own.
 void hda_set_node_volume(HdAudioNode* node, uint32_t volume) {
     uint32_t payload = 0x3000;
     payload |= 0x8000;
 
     // In some cases audio output and pin widgets don't have their own amplifier capabilities.
-    // So, if node does not have output amplifier capability, use ones from AFG.
+    // So, if node does not have output amplifier capability, use ones from AFG or parent node.
     uint32_t output_amplifier_capabilities = node->output_amplifier_capabilities;
+    if (!output_amplifier_capabilities && node->parent_node) {
+        output_amplifier_capabilities = hda_info.nodes[node->parent_node].output_amplifier_capabilities;
+    }
+
     if (!output_amplifier_capabilities) {
         output_amplifier_capabilities = hda_info.afg.output_amplifier_capabilities;
+    }
+
+    if (!output_amplifier_capabilities) {
+        DEBUG_WARN("output amp capabilities are 0 at node %d | %d", node->node, node->node_type);
+        return;
     }
 
     if (volume == 0 && output_amplifier_capabilities & 0x80000000) {
@@ -532,14 +579,10 @@ void hda_set_node_volume(HdAudioNode* node, uint32_t volume) {
         payload |= (volume * ((output_amplifier_capabilities >> 8) & 0x7F) / 100);
     }
 
+    // Set gain.
     hda_send_command(hda_info.codec, node->node, HDA_VERB_SET_AMPLIFIER_GAIN, payload);
 
-    // Check if parent node is valid. If so, set amplifier gain for it too.
-    if (node->parent_node_type != HDA_INVALID) {
-        hda_send_command(hda_info.codec, node->parent_node, HDA_VERB_SET_AMPLIFIER_GAIN, payload);
-    }
-
-    DEBUG_INFO("set node %d volume to %d", node->node, volume);
+    DEBUG_INFO("set node %d | %d volume to %d (amp capabilities: %p)", node->node, node->node_type, volume, output_amplifier_capabilities);
 }
 
 // Set current node volume.
@@ -551,8 +594,12 @@ void hda_set_volume(uint8_t volume) {
 
     hda_info.sound_volume = volume;
 
-    for (uint32_t pin = 0; pin < hda_info.output_widget_count; pin++) {
-        hda_set_node_volume(&hda_info.output_widgets[pin], volume);
+    // Iterate all nodes and set volume for each pin node.
+    // Proven to work on real hardware. VirtualBox and other VMs may have problems with pin volume.
+    for (uint32_t node = 0; node < HDA_MAX_AFG_NODES; node++) {
+        HdAudioNode* current_node = &hda_info.nodes[node];
+        if (current_node->node_type == HDA_WIDGET_AUDIO_OUTPUT || current_node->node_type == HDA_WIDGET_PIN_COMPLEX)
+            hda_set_node_volume(current_node, volume);
     }
 
     DEBUG_INFO("set volume to %d", hda_info.sound_volume);
@@ -580,7 +627,7 @@ void hda_set_sample_rate(uint32_t sample_rate) {
 
 // Construct 16-bit sound format from sample rate, channel count and bits per sample.
 // Used for setting stream format.
-// Credits; BleskOS HDA driver.
+// Credits: BleskOS HDA driver.
 uint16_t hda_return_sound_data_format(uint32_t sample_rate, uint32_t channels, uint32_t bits_per_sample) {
     uint16_t data_format = (channels - 1);
 
@@ -611,6 +658,15 @@ uint16_t hda_return_sound_data_format(uint32_t sample_rate, uint32_t channels, u
     else if (sample_rate==22050) {
         data_format |= (0b1000001 << 8);
     }
+    else if (sample_rate==16000) {
+        data_format |= (0b0000010 << 8);
+    }
+    else if (sample_rate==11025) {
+        data_format |= (0b1000011 << 8);
+    }
+    else if (sample_rate==8000) {
+        data_format |= (0b0000101 << 8);
+    }
     else if (sample_rate==88200) {
         data_format |= (0b1001000 << 8);
     }
@@ -630,13 +686,13 @@ uint16_t hda_return_sound_data_format(uint32_t sample_rate, uint32_t channels, u
 // Play PCM byte array.
 void hda_play(uint8_t* data, uint32_t size) {
     if (!hda_info.is_initialized) {
-        DEBUG_ERROR("hd audio device is not initialized");
+        DEBUG_INFO("hd audio device is not initialized");
         return;
     }
 
     // Do not play if sound card is already busy. In future we may add sound mixing.
     if (hda_info.is_playing) {
-        DEBUG_WARN("already playing! stop current playback before playing next sound");
+        DEBUG_INFO("already playing! stop current playback before playing next sound");
         return;
     }
 
@@ -693,8 +749,8 @@ void hda_play(uint8_t* data, uint32_t size) {
     mmio_write64((void*)(hda_info.output_stream + HDA_STREAM_DESCRIPTOR_BDL_BASE_ADDRESS), hda_info.buffer_entries_dma.phys);
     mmio_write32((void*)(hda_info.output_stream + HDA_STREAM_DESCRIPTOR_RING_BUFFER_LENGTH), HDA_BUFFER_ENTRY_SOUND_BUFFER_SIZE * HDA_BUFFER_ENTRY_COUNT);
 
-    // Write last valid entry of buffer (entries count + 1).
-    mmio_write16((void*)(hda_info.output_stream + HDA_STREAM_DESCRIPTOR_LAST_VALID_INDEX), HDA_BUFFER_ENTRY_COUNT + 1);
+    // Write last valid entry of buffer ( entries count - 1!!!! ).
+    mmio_write16((void*)(hda_info.output_stream + HDA_STREAM_DESCRIPTOR_LAST_VALID_INDEX), HDA_BUFFER_ENTRY_COUNT - 1);
 
     // Get sound format from sample rate, channels and bps.
     uint16_t sound_format = hda_return_sound_data_format(hda_info.sample_rate, hda_info.channels, hda_info.bits_per_sample);
@@ -703,9 +759,12 @@ void hda_play(uint8_t* data, uint32_t size) {
     mmio_write16((void*)(hda_info.output_stream + HDA_STREAM_DESCRIPTOR_STREAM_FORMAT), sound_format);
 
     // Set audio output nodes format.
-    for (uint32_t widget = 0; widget < hda_info.output_widget_count; widget++) {
-        hda_send_command(hda_info.codec, hda_info.output_widgets[widget].node, HDA_VERB_SET_STREAM_FORMAT, sound_format);
-        io_wait();
+    for (uint32_t node = 0; node < HDA_MAX_AFG_NODES; node++) {
+        HdAudioNode* current_node = &hda_info.nodes[node];
+        if (current_node->node_type == HDA_WIDGET_AUDIO_OUTPUT) {
+            hda_send_command(hda_info.codec, current_node->node, HDA_VERB_SET_STREAM_FORMAT, sound_format);
+            io_wait();
+        }
     }
 
     io_wait();
