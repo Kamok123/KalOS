@@ -50,7 +50,6 @@ void hda_init() {
 
     // Try to find HD Audio compatible sound card.
     // Real hardware may have more than one HD Audio device (ex. AMD HD Audio + NVIDIA HD Audio)
-    // TO-DO: initialize all HD Audio controllers present in system or find useful one.
     if (!pci_find_hda(&pci_dev)) {
         DEBUG_ERROR("pci_find_hda failed");
         return;
@@ -70,7 +69,7 @@ void hda_init() {
     uint64_t bar0_size = 0;
     uint64_t bar0_base = pci_get_bar(&pci_dev, 0, &bar0_size);
 
-    // Get virtual address of PCI BAR0. Proper MMIO mapping?
+    // Get virtual address of PCI BAR0.
     hda_info.base = vmm_map_mmio(bar0_base, bar0_size);
     if (!hda_info.base) {
         DEBUG_ERROR("failed to map mmio");
@@ -685,13 +684,13 @@ uint16_t hda_return_sound_data_format(uint32_t sample_rate, uint32_t channels, u
 // Play PCM byte array.
 void hda_play(uint8_t* data, uint32_t size) {
     if (!hda_info.is_initialized) {
-        DEBUG_INFO("hd audio device is not initialized");
+        DEBUG_ERROR("hd audio device is not initialized");
         return;
     }
 
     // Do not play if sound card is already busy. In future we may add sound mixing.
     if (hda_info.is_playing) {
-        DEBUG_INFO("already playing! stop current playback before playing next sound");
+        DEBUG_WARN("already playing! stop current playback before playing next sound");
         return;
     }
 
